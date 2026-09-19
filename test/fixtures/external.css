@@ -1,0 +1,4 @@
+/* served cross-origin WITH CORS headers */
+.cell:hover { background: #0ea5e9; }
+.badge { animation: pulse 2s ease-in-out infinite paused; }
+@keyframes pulse { 50% { opacity: .5; } }

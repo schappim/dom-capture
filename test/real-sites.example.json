@@ -1,0 +1,5 @@
+[
+  ["docs-page", "https://example.com/", "main, article"],
+  ["component-lib", "https://example.com/components/card", "my-card"],
+  ["dense-table", "https://example.com/reference", "table, .sidebar"]
+]

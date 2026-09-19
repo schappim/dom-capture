@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>DOM clobbering fixture</title>
+<style>
+  body { margin: 0; padding: 24px; font: 15px/1.4 Verdana, sans-serif; }
+  form { width: 300px; padding: 12px; border: 2px solid #0d9488; border-radius: 8px; }
+  form input { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; padding: 6px; border: 1px solid #94a3b8; }
+  form:hover { border-color: #f59e0b; }
+</style></head>
+<body>
+<!-- Named elements replace same-named DOM properties on document / their form. -->
+<iframe name="styleSheets" style="display:none"></iframe>
+<img name="adoptedStyleSheets" alt="" style="display:none">
+<form id="login" action="/session">
+  Sign in
+  <input name="shadowRoot" placeholder="shadowRoot">
+  <input name="styleSheets" placeholder="styleSheets">
+  <input name="attributes" placeholder="attributes">
+  <input name="childNodes" placeholder="childNodes">
+  <input name="parentElement" placeholder="parentElement">
+  <input name="id" placeholder="id">
+  <input name="action" placeholder="action">
+</form>
+</body></html>

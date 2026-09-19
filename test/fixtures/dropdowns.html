@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dropdowns fixture — things that appear after the page is actuated</title>
+<style>
+  body { margin: 0; padding: 32px; font: 15px/1.4 system-ui, sans-serif; background: #f1f5f9; color: #0f172a; }
+  .row { display: flex; gap: 48px; align-items: flex-start; }
+  .below { margin-top: 16px; width: 760px; padding: 16px; background: #fde68a; border-radius: 8px; height: 220px; }
+</style>
+</head>
+<body>
+<div class="row">
+  <!-- 1. listbox is a popover="auto" inside an open shadow root: renders in the top layer -->
+  <pop-select id="pop"></pop-select>
+  <!-- 2. listbox is position:absolute inside a closed shadow root; closes on any outside pointerdown / click -->
+  <float-select id="float"></float-select>
+  <!-- 3. a modal <dialog> inside a shadow root: top layer, and everything outside it is inert -->
+  <modal-box id="modal"></modal-box>
+</div>
+<div class="below" id="below">The paragraph underneath. Open dropdowns overlap this block, so a picker that cannot see them highlights this instead.</div>
+
+<script>
+  const OPTION_CSS = `
+    button.trigger { font: 600 14px/1 system-ui, sans-serif; padding: 10px 14px; border-radius: 8px; border: 1px solid #94a3b8; background: white; cursor: pointer; width: 200px; text-align: left; }
+    .list { margin: 0; padding: 6px; list-style: none; width: 200px; box-sizing: border-box; background: white; border: 1px solid #94a3b8; border-radius: 10px; box-shadow: 0 12px 32px rgba(15, 23, 42, .25); }
+    .opt { padding: 9px 10px; border-radius: 6px; font: 14px/1.2 system-ui, sans-serif; color: #0f172a; }
+    .opt:hover { background: #e0e7ff; }
+    .opt[aria-selected="true"] { background: #4f46e5; color: white; }
+  `;
+  const OPTIONS = ['Apple', 'Banana', 'Cherry'].map((t, i) => `<li class="opt" role="option" data-v="${t}" aria-selected="${i === 1}">${t}</li>`).join('');
+
+  class PopSelect extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>${OPTION_CSS}
+          :host { display: block; }
+          .list[popover] { position: fixed; inset: auto; top: 80px; left: 32px; }
+        </style>
+        <button class="trigger" popovertarget="list">Popover select ▾</button>
+        <ul class="list" id="list" popover="auto" role="listbox">${OPTIONS}</ul>`;
+      this.list = root.getElementById('list');
+    }
+    open() { this.list.showPopover(); }
+    get isOpen() { return this.list.matches(':popover-open'); }
+  }
+  customElements.define('pop-select', PopSelect);
+
+  class FloatSelect extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'closed' });
+      root.innerHTML = `
+        <style>${OPTION_CSS}
+          :host { display: block; position: relative; }
+          .list { position: absolute; top: 48px; left: 0; z-index: 1000; display: none; }
+          :host([open]) .list { display: block; }
+        </style>
+        <button class="trigger">Floating select ▾</button>
+        <ul class="list" role="listbox">${OPTIONS}</ul>`;
+      root.querySelector('.trigger').addEventListener('click', () => this.toggleAttribute('open'));
+      // "Click outside" the way Floating UI / Radix do it: document-level, capture phase.
+      for (const type of ['pointerdown', 'mousedown', 'click'])
+        document.addEventListener(type, (e) => { if (!e.composedPath().includes(this)) { this.removeAttribute('open'); window.__outsideSaw = type; } }, true);
+    }
+    open() { this.setAttribute('open', ''); }
+    get isOpen() { return this.hasAttribute('open'); }
+  }
+  customElements.define('float-select', FloatSelect);
+
+  class ModalBox extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>
+          button { font: 600 14px/1 system-ui, sans-serif; padding: 10px 14px; border-radius: 8px; border: 1px solid #94a3b8; background: white; }
+          dialog { border: 0; border-radius: 14px; padding: 24px; width: 300px; box-shadow: 0 24px 60px rgba(15, 23, 42, .35); }
+          dialog::backdrop { background: rgba(15, 23, 42, .4); }
+          h2 { margin: 0 0 8px; font: 700 18px/1.2 system-ui, sans-serif; color: #7c2d12; }
+          p { margin: 0; color: #475569; }
+        </style>
+        <button>Open modal</button>
+        <dialog><h2 id="title">Modal title</h2><p>Body of a modal dialog.</p></dialog>`;
+      this.dialog = root.querySelector('dialog');
+      root.querySelector('button').addEventListener('click', () => this.open());
+    }
+    open() { this.dialog.showModal(); }
+    get isOpen() { return this.dialog.open; }
+  }
+  customElements.define('modal-box', ModalBox);
+</script>
+</body>
+</html>

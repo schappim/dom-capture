@@ -1,0 +1,165 @@
+# DOM Capture
+
+> Point at any element on a page, click it, and get that element — **with every style it and its descendants need** — on your clipboard as self-contained HTML.
+
+Paste the result into an empty `.html` file and it renders the same, with no dependency on the original site's stylesheets, class names or JavaScript.
+
+Works on plain pages and on pages built from **web components** — open *and* closed shadow roots, slots, `::slotted`, `:host`, `::part`, adopted stylesheets, nested components.
+
+```
+┌─ page ──────────────────┐            ┌─ clipboard ─────────────┐
+│  ╔═══════════════════╗  │            │  <style> … </style>     │
+│  ║  the element you  ║  │   click →  │  <article class="dc…">  │
+│  ║  pointed at       ║  │            │      …                  │
+│  ╚═══════════════════╝  │            │  </article>             │
+└─────────────────────────┘            └─────────────────────────┘
+   500 stylesheets, 40 classes,           one <style>, no page
+   3 shadow roots, 2 CDNs                 classes, nothing external
+```
+
+---
+
+## Install
+
+1. Open `chrome://extensions` and switch on **Developer mode**.
+2. **Load unpacked** → choose the `extension/` folder.
+3. Pin the DOM Capture icon if you like.
+
+Needs a Chromium-based browser, version 120 or newer.
+
+**Permissions:** `activeTab` + `scripting` (it only ever touches the tab you invoke it on), `clipboardWrite`, and `storage` for your options. No host permissions, no background activity, nothing leaves your machine.
+
+## Use
+
+1. Click the toolbar icon, or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>.
+2. Move the mouse — the element under the cursor is outlined and labelled with its tag and size.
+3. **Click** to capture. The snippet is on your clipboard straight away.
+
+| Key | |
+| --- | --- |
+| <kbd>Click</kbd> / <kbd>Enter</kbd> | capture the highlighted element |
+| <kbd>↑</kbd> | widen to the parent (climbs out of slots and shadow roots too) |
+| <kbd>↓</kbd> | narrow back down |
+| <kbd>Esc</kbd> / right-click | quit |
+
+While you pick, an invisible overlay receives the mouse, so the page never sees your hover or click: links don't navigate, menus don't open, and the element is captured in its resting, un-hovered state.
+
+After a capture you can **Copy again**, **Download .html** (a complete standalone page), **Preview** it in a new tab, or **Pick another**.
+
+### Capturing dropdowns, popovers and dialogs
+
+Anything that only exists once the page has been actuated: **open it first, then press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>.** The shortcut leaves focus on the page so the menu stays open — clicking the toolbar button takes focus away, which closes many menus.
+
+The overlay joins the browser's top layer, so it sits above `popover` elements and `<dialog>`s — including ones inside shadow roots, and ones that open *after* the picker started. Every mouse event is swallowed before the page's "click outside" handlers or the browser's popover light-dismiss can close what you are picking.
+
+Menus held open purely by CSS `:hover` still close, because the page gets no hover.
+
+---
+
+## What you paste
+
+```html
+<!-- DOM Capture: <article> from https://example.com/pricing -->
+<style>
+@font-face { … }
+@keyframes spin { … }
+.dck3f9-1 { all: initial; display: block; padding: 20px; border-radius: 12px; … }
+.dck3f9-1::before { content: ""; position: absolute; … }
+.dck3f9-2 { all: unset; display: flex; align-items: center; gap: 12px; }
+.dck3f9-7:hover { background: rgb(55, 48, 163); transform: translateY(-1px); }
+…
+</style>
+<article class="dck3f9 dck3f9-1" id="card"><header class="dck3f9-2">…</header>…</article>
+```
+
+- **None of the page's class names are reused.** Every `class` in the output is generated (`dc` + 4 random characters, checked to be unused on the page, so two captures never collide either). The original `class` attributes, inline `style`s, `on*` handlers and `<script>`s are dropped; the header comment names only the tag.
+- Identical elements share one class, so lists and grids stay compact.
+- Custom elements are renamed (`<user-card>` → `<user-card-snapshot>`) so a destination page that happens to define the same element can't re-upgrade and wipe the captured content.
+
+## Options
+
+Behind the **Options** button in the picker bar.
+
+| Option | Default | |
+| --- | --- | --- |
+| Hover & focus states | on | carry `:hover`, `:focus`, `:focus-visible`, `:focus-within`, `:active` rules |
+| Page background | on | if the element is transparent, give it the background colour it was sitting on — white text from a dark page stays readable |
+| Lock width | on | pin the root to the width it had on the page (it no longer has its column/flex parent to size it) |
+| Web fonts | on | bring the `@font-face` rules for the weights and styles actually used |
+| Embed all images & fonts | off | inline every asset as a `data:` URI — larger, but fully offline |
+
+---
+
+## How it works
+
+`extension/src/capture.js` is the serializer; `extension/src/picker.js` is the UI.
+
+**1. A predictable baseline.** Each captured element gets a class whose rule starts with `all: unset` (the root: `all: initial`). That cancels user-agent styles *and* whatever the destination page does to `p`, `button`, `h2`… so an element with no declaration is fully predictable: inherited properties take the parent's value, the rest take the CSS initial value.
+
+**2. Typed OM instead of `getComputedStyle`.** `element.computedStyleMap()` returns *computed* values — `width: 50%`, `margin: 0 auto`, `grid-template-columns: repeat(3, 1fr)`, `line-height: 1.5`, `translate(10%)` — where `getComputedStyle` would freeze them into pixels. The copy therefore stays fluid. Only properties that differ from the baseline are written (typically 5–15 per element rather than ~400), then folded into shorthands.
+
+**3. Nothing hard-coded about CSS.** Initial values, which properties inherit, and which default to `currentcolor` are all measured at capture time in a scratch `about:blank` iframe, so new CSS properties work without an update.
+
+**4. The flat tree.** The walker follows what is *rendered*: a shadow host's children are its shadow tree, a `<slot>`'s children are its assigned nodes (or its fallback content), unslotted light DOM is skipped. Closed shadow roots are reached through `chrome.dom.openOrClosedShadowRoot()`. Since computed styles already include the effect of `:host`, `::slotted()`, `::part()` and CSS variables crossing the boundary, the component renders the same with no JavaScript and no shadow DOM.
+
+**5. Things computed style can't see** are recovered from the stylesheets of the document and of every shadow root involved — including `adoptedStyleSheets`, `@import`, `@media` / `@supports` / `@layer`, CSS nesting, and cross-origin sheets when the CDN sends CORS headers:
+
+- `::before`, `::after`, `::marker`, `::placeholder`
+- `:hover` / `:focus` / `:active` rules — including ancestor forms such as `.group:hover .child` and `a:hover::after` — re-targeted at the generated classes with `var()` resolved
+- `@keyframes` — animated elements are read with their CSS animations momentarily detached, so the copy animates from the true base style rather than a mid-flight frame
+- `@font-face`, picked with the CSS font-matching algorithm for the weights in use
+
+**6. Things that would silently break on another origin are inlined automatically:** CSS `mask-image`s (cross-origin masks need CORS), web fonts whose server doesn't send `Access-Control-Allow-Origin: *`, SVG `<use href="sprite.svg#icon">` sprites (same-origin only), plus same-page `<symbol>`s, gradients and clip-paths referenced from outside the captured subtree.
+
+**7. Live state is baked in:** input values, checked/selected state, `<canvas>` pixels (as an `<img>`), the `currentSrc` an `<img srcset>` actually chose. URLs are made absolute. `fill: currentColor` stays a keyword so icons follow hover colour changes.
+
+Pages can't break the capture by naming elements after DOM properties (`<iframe name="styleSheets">`, a form control named `id` or `shadowRoot`…): those properties are read through the browser's native getters.
+
+---
+
+## When something goes wrong
+
+If a capture fails, the panel shows the error and a **Copy debug log** button. The same button is on the success panel, for "it copied, but looks wrong" reports.
+
+The log is plain text: extension version, page URL, browser, options, the picked element's ancestor trail and opening tag, a timed timeline of every capture step (stylesheets indexed per shadow root, elements walked, states matched, assets inlined…), warnings, and — on failure — the error, its stack, and the last step reached. It stays on your clipboard; nothing is sent anywhere.
+
+## Known limits
+
+- It is a **snapshot of the current viewport and state**: only `@media` rules that match right now are considered, `vw`/`rem`/`em` lengths arrive as pixels, and breakpoints don't travel. Percentages, `fr`, `auto`, flex and grid *do* stay fluid.
+- Behaviour doesn't travel — no JavaScript, so dropdowns, tabs and carousels are captured as they looked.
+- States that depend on a custom property changing (`.btn:hover { --bg: … }`), on `:host(:hover)`, on sibling combinators (`input:focus + label`), or nested inside `:not()` / `:is()` / `:has()` are skipped; so are `::selection`, scrollbar and `::first-letter` styles.
+- Stylesheets on another origin *without* CORS headers can't be read, so hover rules, keyframes and fonts defined only there are missing — you get a warning naming the sheet. The element's resting appearance is unaffected.
+- Sizing of `::before` / `::after` comes from `getComputedStyle` (pixels) unless a readable stylesheet shows it was `auto` or a percentage.
+- Behind a **modal** `<dialog>` the browser makes everything else inert, the overlay included: picking still works, but the dialog's content does see your `:hover` while you pick.
+- `<iframe>` content is not entered (the iframe is kept with an absolute `src`); `<video>` and `blob:` media keep their URLs.
+- Quirks-mode pages (no doctype) can differ by a few pixels once pasted into a standards-mode file.
+- Privileged pages (`chrome://`, the extension gallery, the PDF viewer) can't be scripted at all — the icon shows a red `!` there.
+
+---
+
+## Development
+
+```sh
+npm install
+npx playwright install chromium   # once; the e2e run needs a build that can load unpacked extensions
+npm test
+```
+
+| Script | |
+| --- | --- |
+| `npm test` | capture suite + end-to-end suite |
+| `npm run test:capture` | capture suite only |
+| `npm run test:e2e` | end-to-end suite only |
+| `npm run test:sites` | manual smoke test against live pages (see below) |
+| `npm run icons` | re-render the PNG icons from `scripts/icon.svg` |
+| `npm run zip` | package `extension/` for distribution |
+
+**`test/run.mjs`** captures elements from the fixture pages in a real browser, renders the snippet in an empty `about:blank` page and **pixel-diffs** it against the original (currently 0.00% difference), hovers and focuses the copy to verify states, and asserts on the generated markup and CSS — for example, that none of the page's class names appear in the output. `test/fixtures/components.html` is the web-components torture test; `clobber.html` is a page whose named elements shadow DOM properties.
+
+**`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog.
+
+**`test/real-sites.mjs`** is a manual, network-dependent smoke test. Its targets aren't checked in: copy `test/real-sites.example.json` to `test/real-sites.json` and list your own pages as `["name", "url", "css selector"]`. Screenshots land in `test/output/real/`.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
