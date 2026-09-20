@@ -27,7 +27,7 @@ Works on plain pages and on pages built from **web components** — open *and* c
 
 Needs a Chromium-based browser, version 120 or newer.
 
-**Permissions:** `activeTab` + `scripting` (it only ever touches the tab you invoke it on), `clipboardWrite`, and `storage` for your options. No host permissions, no background activity, nothing leaves your machine.
+**Permissions:** `activeTab` + `scripting` (it only ever touches the tab you invoke it on), `clipboardWrite`, and `storage` for your options. No host permissions up front, no background activity, nothing leaves your machine. Access to one more site is asked for only when you capture an `<iframe>` from it and press **Allow** (see [Iframes](#iframes)).
 
 ## Use
 
@@ -60,6 +60,14 @@ The overlay joins the browser's top layer, so it sits above `popover` elements a
 Menus held open purely by CSS `:hover` still close, because the page gets no hover.
 
 ---
+
+### Iframes
+
+An `<iframe>` is captured together with the document it is showing right now: that document is captured by the same engine, from inside the frame, and travels as the iframe's `srcdoc` — styles, shadow DOM, nested frames and all, without its scripts. The `src` would be no use anywhere else: embedded apps (an admin app, a payment form, a dashboard widget) sign their URLs per session and refuse to load outside their host.
+
+`activeTab` reaches the page and its same-origin frames. A frame from **another site** needs that site granted: the result panel then shows **Allow & capture the iframe too**, Chrome asks once for that site only, and the capture runs again with the frame inlined. Until then the iframe keeps its `src` and the panel says so. A frame's contents go from the frame to the extension and never through `window.postMessage`, so the embedding page cannot use your capture to read a cross-origin frame.
+
+Pick the iframe itself (or anything around it — use **↑ Parent**). Picking a single element *inside* a frame is not supported yet.
 
 ## What you paste
 
@@ -136,7 +144,8 @@ The log is plain text: extension version, page URL, browser, options, the picked
 - Stylesheets on another origin *without* CORS headers can't be read, so hover rules, keyframes and fonts defined only there are missing — you get a warning naming the sheet. The element's resting appearance is unaffected.
 - Sizing of `::before` / `::after` comes from `getComputedStyle` (pixels) unless a readable stylesheet shows it was `auto` or a percentage.
 - Behind a **modal** `<dialog>` the browser makes everything else inert, the overlay included: picking still works, but the dialog's content does see your `:hover` while you pick.
-- `<iframe>` content is not entered (the iframe is kept with an absolute `src`); `<video>` and `blob:` media keep their URLs.
+- You cannot pick an element *inside* an `<iframe>` — only the iframe (with its whole document, see [Iframes](#iframes)) or something around it. A frame the extension cannot be injected into (a `data:` URL, a sandboxed frame on some sites) keeps its `src`.
+- `<video>` and `blob:` media keep their URLs.
 - Quirks-mode pages (no doctype) can differ by a few pixels once pasted into a standards-mode file.
 - Privileged pages (`chrome://`, the extension gallery, the PDF viewer) can't be scripted at all — the icon shows a red `!` there.
 
@@ -162,6 +171,8 @@ npm test
 **`test/run.mjs`** captures elements from the fixture pages in a real browser, renders the snippet in an empty `about:blank` page and **pixel-diffs** it against the original (currently 0.00% difference), hovers and focuses the copy to verify states, and asserts on the generated markup and CSS — for example, that none of the page's class names appear in the output. `test/fixtures/components.html` is the web-components torture test; `clobber.html` is a page whose named elements shadow DOM properties.
 
 **`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog.
+
+**`test/e2e-frames.mjs`** captures same-origin, cross-origin and nested iframes (`test/fixtures/frames.html`), pastes the result and compares what the frames show — once with the extension allowed on the frames' site, once with the page's origin only, where the cross-origin frame must keep its `src` and the panel must offer to allow it.
 
 **`test/real-sites.mjs`** is a manual, network-dependent smoke test. Its targets aren't checked in: copy `test/real-sites.example.json` to `test/real-sites.json` and list your own pages as `["name", "url", "css selector"]`. Screenshots land in `test/output/real/`.
 

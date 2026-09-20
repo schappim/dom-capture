@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DOM Capture — allow an embedded frame</title>
+<style>
+  body { margin: 0; padding: 24px; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e5e7eb; background: #111827; }
+  h1 { margin: 0 0 8px; font-size: 16px; color: #fff; }
+  p { margin: 0 0 12px; color: #9ca3af; }
+  code { display: block; margin: 0 0 16px; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #c4b5fd; word-break: break-all; }
+  button { font: 600 13px/1 system-ui, sans-serif; padding: 10px 16px; border: 0; border-radius: 999px; cursor: pointer; color: #e5e7eb; background: rgba(255,255,255,.12); }
+  button.primary { color: #fff; background: #6d5efc; }
+</style>
+</head>
+<body>
+<h1>Read the embedded frame?</h1>
+<p>The element you captured contains an &lt;iframe&gt; from another site. To copy what it shows, DOM Capture needs access to:</p>
+<code id="origins"></code>
+<button class="primary" id="allow">Allow</button>
+<button id="cancel">Not now</button>
+<script src="permit.js"></script>
+</body>
+</html>

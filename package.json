@@ -5,9 +5,9 @@
   "description": "Browser extension: pick any element and copy it as self-contained HTML + CSS",
   "license": "MIT",
   "scripts": {
-    "test": "node test/run.mjs && node test/e2e.mjs",
+    "test": "node test/run.mjs && node test/e2e.mjs && node test/e2e-frames.mjs",
     "test:capture": "node test/run.mjs",
-    "test:e2e": "node test/e2e.mjs",
+    "test:e2e": "node test/e2e.mjs && node test/e2e-frames.mjs",
     "test:sites": "node test/real-sites.mjs",
     "icons": "for s in 16 32 48 128; do rsvg-convert -w $s -h $s scripts/icon.svg -o extension/icons/icon$s.png; done",
     "zip": "cd extension && zip -r ../dom-capture.zip . -x '*.DS_Store'"

@@ -5,6 +5,7 @@
   "description": "Pick any element on a page and copy it — with all the styles it needs — as self-contained HTML you can paste anywhere.",
   "minimum_chrome_version": "120",
   "permissions": ["activeTab", "scripting", "storage", "clipboardWrite"],
+  "optional_host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "action": {
     "default_title": "Capture an element (Alt+Shift+C)",

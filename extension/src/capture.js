@@ -39,6 +39,8 @@
     embedAssets: false, // inline *every* image and font as data: URIs (masks + CORS-less fonts always are)
     pinWidth: true, // lock the root to the width it had on the page
     backdrop: true, // give a transparent root the background it was sitting on
+    frames: true, // replace each <iframe>'s src by a capture of the document it is showing
+    asFrame: false, // (internal) the root is the <body> of such a document: `page` is what goes in srcdoc
     id: null, // class prefix; random when null
     getShadowRoot: null, // test hook standing in for chrome.dom
     fetchTimeout: 2500,
@@ -105,6 +107,7 @@
     parentElement: nativeGetter(Node.prototype, 'parentElement'),
     docSheets: nativeGetter(Document.prototype, 'styleSheets'),
     docAdopted: nativeGetter(Document.prototype, 'adoptedStyleSheets'),
+    frameWindow: nativeGetter(HTMLIFrameElement.prototype, 'contentWindow'),
     rootSheets: nativeGetter(ShadowRoot.prototype, 'styleSheets'),
     rootAdopted: nativeGetter(ShadowRoot.prototype, 'adoptedStyleSheets'),
   };
@@ -680,7 +683,10 @@
       this.animations = new Set();
       this.refIds = new Set();
       this.externalUses = []; // <use href="sprite.svg#icon">
+      this.frames = []; // <iframe>s, whose documents get captured by the copy of this script running inside them
+      this.blockedFrames = new Set(); // origins the extension would need access to for that
       this.dropped = 0;
+      this.frameElements = 0;
       this.supportCache = new Map();
       this.outDoc = document.implementation.createHTMLDocument('');
       this.t0 = performance.now();
@@ -742,6 +748,10 @@
       this.step('css built', `${css.length} chars`);
       css = await this.embedAssets(css, holder);
       this.step('assets inlined');
+      if (this.frames.length) {
+        const inlined = await this.captureFrames();
+        this.step('frames', `${inlined} of ${this.frames.length} inlined${this.blockedFrames.size ? ` — no access to ${[...this.blockedFrames].join(', ')}` : ''}`);
+      }
 
       const label = describe(root);
       // What we write into the output names the tag only — no page class names.
@@ -753,7 +763,9 @@
         '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n' +
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
         `<title>&lt;${escapeHtml(name)}&gt; — captured from ${escapeHtml(location.hostname || 'page')}</title>\n` +
-        `<style>body { margin: 0; padding: 24px;${this.backdropColor ? ` background: ${this.backdropColor};` : ''} }</style>\n` +
+        (opts.asFrame
+          ? `<style>html, body { height: 100%; margin: 0; }${this.canvasColor() ? ` html { background: ${this.canvasColor()}; }` : ''}</style>\n`
+          : `<style>body { margin: 0; padding: 24px;${this.backdropColor ? ` background: ${this.backdropColor};` : ''} }</style>\n`) +
         `</head>\n<body>\n${snippet}</body>\n</html>\n`;
       this.step('done', `${snippet.length} chars`);
       if (this.dropped) this.warnings.add(`${this.dropped} declaration(s) could not be serialized and were skipped.`);
@@ -761,8 +773,9 @@
         snippet,
         page,
         label,
+        blockedFrames: [...this.blockedFrames],
         stats: {
-          elements: this.list.length,
+          elements: this.list.length + this.frameElements,
           rules: this.ruleCount,
           bytes: new Blob([snippet]).size,
         },
@@ -895,7 +908,50 @@
       }
 
       if (isHtml) this.freezeState(src, out, tag);
+      if (isHtml && tag === 'iframe' && this.opts.frames) this.frames.push({ src, out });
       return out;
+    }
+
+    /**
+     * An <iframe src> pasted somewhere else shows a login page, an error, or nothing (embedded apps
+     * are signed per session) — so the document it is showing right now travels along as srcdoc.
+     */
+    async captureFrames() {
+      let inlined = 0;
+      await Promise.all(
+        this.frames.map(async ({ src, out }) => {
+          const reply = await askFrame(src, this.opts);
+          if (reply.page) {
+            inlined++;
+            out.setAttribute('srcdoc', reply.page);
+            for (const name of ['src', 'sandbox', 'allow', 'loading', 'referrerpolicy', 'csp']) out.removeAttribute(name);
+            this.frameElements += reply.elements || 0;
+            for (const w of reply.warnings || []) this.warnings.add(`In an <iframe>: ${w}`);
+            for (const origin of reply.blockedFrames || []) this.blockedFrames.add(origin);
+            return;
+          }
+          let origin = null;
+          try {
+            const url = new URL(src.src, src.baseURI);
+            if (/^https?:$/.test(url.protocol) && url.origin !== location.origin) origin = url.origin;
+          } catch {
+            /* no usable src */
+          }
+          if (reply.unreachable && origin) this.blockedFrames.add(origin);
+          else this.warnings.add(`The contents of an <iframe> could not be captured (${reply.error || 'its document did not answer'}) — it still points at its src.`);
+        }),
+      );
+      if (this.blockedFrames.size) this.warnings.add(`DOM Capture has no access to the <iframe> from ${[...this.blockedFrames].join(', ')}, so it still points at its src.`);
+      return inlined;
+    }
+
+    /** What the viewport of this document is painted with: the root's background, else the body's. */
+    canvasColor() {
+      for (const el of [document.documentElement, document.body]) {
+        const bg = el && getComputedStyle(el).getPropertyValue('background-color');
+        if (bg && !isTransparent(bg)) return bg;
+      }
+      return null;
     }
 
     /** Bake live state (chosen image, form values) into attributes. */
@@ -1641,6 +1697,66 @@
         /* frozen error object */
       }
       throw error;
+    }
+  }
+
+  // ------------------------------------------------------------------ frames
+  //
+  // A document in an <iframe> is captured by the copy of this script running inside it (the
+  // background page injects into every frame it may). The parent hands a nonce to the frame's
+  // window; the answer comes back through the extension (runtime message, relayed by the
+  // background page) and never through postMessage — the embedding page must not get to read
+  // a cross-origin frame just because the user captured it.
+  const FRAME_MSG = 'dom-capture:frame';
+  const runtime = globalThis.chrome?.runtime?.id ? globalThis.chrome.runtime : null;
+  const waiting = new Map(); // nonce -> callback
+  const tell = (msg) => {
+    try {
+      runtime.sendMessage({ type: FRAME_MSG, ...msg }, () => void runtime.lastError);
+    } catch {
+      /* extension reloaded under us */
+    }
+  };
+
+  function askFrame(iframe, opts) {
+    const win = dom.frameWindow(iframe);
+    if (!runtime || !win) return Promise.resolve({ error: runtime ? 'it has no document' : 'only the extension can look inside' });
+    return new Promise((resolve) => {
+      const nonce = crypto.randomUUID();
+      let answered = false;
+      const finish = (reply) => {
+        waiting.delete(nonce);
+        clearTimeout(noAnswer);
+        clearTimeout(tooLong);
+        resolve(reply);
+      };
+      waiting.set(nonce, (msg) => (msg.ack ? (answered = true) : finish(msg)));
+      const noAnswer = setTimeout(() => answered || finish({ unreachable: true }), 1500);
+      const tooLong = setTimeout(() => finish({ error: 'it took too long' }), 45000);
+      const { states, fonts, embedAssets } = opts;
+      win.postMessage({ [FRAME_MSG]: nonce, options: { states, fonts, embedAssets } }, '*');
+    });
+  }
+
+  if (runtime) {
+    runtime.onMessage.addListener((msg) => {
+      if (msg?.type === FRAME_MSG) waiting.get(msg.nonce)?.(msg);
+    });
+    if (window.parent !== window) {
+      window.addEventListener('message', async (e) => {
+        const nonce = e.data?.[FRAME_MSG];
+        if (typeof nonce !== 'string' || e.source !== window.parent) return;
+        e.stopImmediatePropagation();
+        tell({ nonce, ack: true });
+        try {
+          // (The page may have written this message itself: take booleans, nothing else.)
+          const { states, fonts, embedAssets } = e.data.options || {};
+          const result = await capture(document.body || document.documentElement, { states: !!states, fonts: !!fonts, embedAssets: !!embedAssets, asFrame: true, pinWidth: false, backdrop: false });
+          tell({ nonce, page: result.page, elements: result.stats.elements, warnings: result.warnings, blockedFrames: result.blockedFrames });
+        } catch (err) {
+          tell({ nonce, error: String(err?.message || err) });
+        }
+      });
     }
   }
 

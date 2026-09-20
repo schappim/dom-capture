@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Framed document</title>
+<style>
+  html { background: #ecfeff; }
+  body { margin: 12px; font: 15px/1.4 system-ui, sans-serif; color: #164e63; }
+  .framed-title { margin: 0 0 6px; font-size: 18px; color: #be123c; }
+  .framed-note { margin: 0; padding: 6px 10px; border-left: 4px solid #0891b2; background: #cffafe; }
+</style>
+</head>
+<body>
+<h3 class="framed-title">Framed heading</h3>
+<p class="framed-note">Text that only exists inside the frame, on <span class="host"></span>.</p>
+<script>document.querySelector('.host').textContent = location.host;</script>
+</body>
+</html>

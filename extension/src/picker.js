@@ -41,6 +41,20 @@
   ];
   const defaults = Object.fromEntries(OPTION_LABELS.map(([key]) => [key, DC.DEFAULTS[key]]));
   const storage = globalThis.chrome?.storage?.sync;
+  /** Ask the background page for something; resolves to null when it cannot be reached (or is slow). */
+  const ask = (msg, timeout = 4000) =>
+    new Promise((resolve) => {
+      const done = setTimeout(resolve, timeout, null);
+      try {
+        chrome.runtime.sendMessage(msg, (reply) => {
+          void chrome.runtime.lastError;
+          clearTimeout(done);
+          resolve(reply ?? null);
+        });
+      } catch {
+        resolve(null);
+      }
+    });
 
   // Everything the mouse can tell a page. Handled (and stopped) on window, in the
   // capture phase, so it works whoever the browser decided the target was.
@@ -165,6 +179,8 @@
       this.build();
       this.setMode('pick');
       window.addEventListener('keydown', this.onKey, true);
+      if (!this.listening) globalThis.chrome?.runtime?.onMessage?.addListener((msg) => void (msg?.type === 'dom-capture:retry' && this.active && this.mode === 'done' && this.captureTarget()));
+      this.listening = true;
       for (const type of MOUSE_EVENTS) window.addEventListener(type, this.onMouse, true);
       const tick = () => {
         if (!this.active) return;
@@ -503,6 +519,8 @@
       // Let the "Capturing…" state paint before the synchronous style walk.
       await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
       try {
+        // Frames that loaded after the toolbar click need the capture script too.
+        await ask({ type: 'dom-capture:refresh-frames' }, 1500);
         const result = (this.result = await DC.capture(el, this.options));
         this.log = result.debugLog;
         const copied = await copyText(result.snippet);
@@ -537,6 +555,12 @@
       );
       const remarks = [...result.warnings, ...(result.notes || [])];
       if (remarks.length) this.panel.append(h('ul', {}, ...remarks.slice(0, 5).map((w) => h('li', {}, w))));
+      if (result.blockedFrames?.length) {
+        const sites = result.blockedFrames.map((o) => new URL(o).host).join(', ');
+        const allow = h('button', { class: 'primary', 'data-act': 'allow-frames', onclick: (button) => this.allowFrames(button), title: `Let DOM Capture read ${sites}, then capture again` }, 'Allow & capture the iframe too');
+        actions.prepend(allow);
+        actions.querySelector('.primary + .primary')?.classList.remove('primary');
+      }
       this.panel.append(actions);
       this.setMode('done');
     },
@@ -556,6 +580,14 @@
         ),
       );
       this.setMode('done');
+    },
+
+    /** The capture met an <iframe> from a site the extension may not read: ask for that site, then go again. */
+    async allowFrames(button) {
+      const reply = await ask({ type: 'dom-capture:allow-frames', origins: this.result?.blockedFrames || [] }, 120000);
+      if (!this.active || this.mode !== 'done') return;
+      if (reply?.ok) this.captureTarget();
+      else button.textContent = reply?.asking ? 'Waiting for your OK in the new window…' : 'Not allowed — the iframe keeps its src';
     },
 
     async copyLog(button) {

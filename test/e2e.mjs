@@ -58,6 +58,15 @@ try {
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/capture.js', 'src/picker.js'] });
     });
   const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
+  // Polled from here rather than with waitForFunction, which has been seen to come back early.
+  const copied = async (text) => {
+    for (let i = 0; i < 75; i++) {
+      const now = await clipboard().catch(() => '');
+      if (now.includes(text)) return now;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`"${text}" never reached the clipboard`);
+  };
   // The picker's UI is in a closed shadow root, but the picker object itself can be asked from the
   // extension's isolated world: where one of its buttons is, and what is selected right now.
   const button = (act) =>
@@ -120,7 +129,7 @@ try {
   check('a click selects — it does not capture yet', (await selection()).startsWith('select ') && (await clipboard()) === '', `${await selection()} / ${(await clipboard()).slice(0, 40)}`);
   await page.screenshot({ path: path.join(outDir, 'e2e-selected.png') });
   await press('capture');
-  await page.waitForFunction(() => navigator.clipboard.readText().then((t) => t.includes('DOM Capture:')), null, { timeout: 10000 });
+  await copied('DOM Capture:');
   await page.waitForTimeout(200);
   await page.screenshot({ path: path.join(outDir, 'e2e-result.png') });
   const first = await clipboard();
@@ -141,7 +150,7 @@ try {
   await page.mouse.move(x, y);
   for (let i = 0; i < 8; i++) await page.keyboard.press('ArrowUp'); // …all the way up to <body>
   await page.keyboard.press('Enter');
-  await page.waitForFunction(() => navigator.clipboard.readText().then((t) => t.includes('Ada Lovelace')), null, { timeout: 10000 });
+  await copied('Ada Lovelace');
   const wide = await clipboard();
   check('↑ climbs out of the shadow tree to ancestors, Enter captures', wide.includes('closed root:') && wide.includes('Ada Lovelace') && wide.includes('shadow root on a plain div'));
   check('overlay never leaks into the capture', !wide.includes('dom-capture-ui') && !wide.includes('data-dom-capture-ui'));
@@ -162,7 +171,7 @@ try {
   await page.waitForSelector('dom-capture-ui', { state: 'detached' });
   await inject();
   await page.waitForSelector('dom-capture-ui', { state: 'attached' });
-  await page.evaluate(() => (delete window.__pageSawMouse, navigator.clipboard.writeText('')));
+  await page.evaluate(() => (delete window.__pageSawMouse, navigator.clipboard.writeText(''))); // (evaluate waits for the returned promise)
   const [bx, by] = await center('#open-card .bio b');
   await page.mouse.move(bx - 3, by);
   await page.mouse.move(bx, by);
@@ -196,7 +205,7 @@ try {
   check('the ancestor trail jumps straight to an ancestor', (await selection()) === 'select user-card#open-card', await selection());
   check('nothing is copied until asked', (await clipboard()) === '');
   await press('capture');
-  await page.waitForFunction(() => navigator.clipboard.readText().then((t) => t.includes('Ada Lovelace')), null, { timeout: 10000 });
+  await copied('Ada Lovelace');
   const card = await clipboard();
   check('Capture copies the adjusted selection', card.startsWith('<!-- DOM Capture: <user-card> ') && card.includes('Ada Lovelace') && !card.includes('light child of closed host'), card.slice(0, 60));
   await press('Adjust selection');
@@ -220,8 +229,8 @@ try {
   const openAndPick = async (id) => {
     await page.goto(`${origin}/dropdowns.html`);
     await page.bringToFront();
-    await page.evaluate((id) => {
-      navigator.clipboard.writeText('');
+    await page.evaluate(async (id) => {
+      await navigator.clipboard.writeText(''); // before anything is captured, or it may land after
       for (const type of ['click', 'mousedown', 'pointerdown', 'pointerup', 'mouseover']) document.addEventListener(type, (e) => e.isTrusted && (window.__pageSawMouse = type), true);
       document.getElementById(id).open();
     }, id);
@@ -229,7 +238,6 @@ try {
     await page.waitForSelector('dom-capture-ui', { state: 'attached' });
   };
   const isOpen = (id) => page.evaluate((id) => document.getElementById(id).isOpen, id);
-  const copied = (text) => page.waitForFunction((t) => navigator.clipboard.readText().then((c) => c.includes(t)), text, { timeout: 10000 }).then(clipboard);
   const hover = async (x, y) => {
     await page.mouse.move(x - 4, y);
     await page.mouse.move(x, y);
