@@ -33,18 +33,23 @@ Needs a Chromium-based browser, version 120 or newer.
 
 1. Click the toolbar icon, or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>.
 2. Move the mouse — the element under the cursor is outlined and labelled with its tag and size.
-3. **Click** to capture. The snippet is on your clipboard straight away.
+3. **Click** to select it. The outline turns amber and stays put, and a small panel appears above the toolbar.
+4. Adjust the selection if the element you want is hard to hit — a wrapper with no pixel of its own, say:
+   **↑ Parent** / **↓ Child** walk up and down the tree (Child retraces the way you came up), **← Previous** / **Next →** step through siblings, and the ancestor trail underneath jumps straight to any ancestor. Hovering a button previews where it leads. Clicking another element on the page moves the selection there.
+5. Press **Capture** (or <kbd>Enter</kbd>). The snippet is on your clipboard straight away.
 
 | Key | |
 | --- | --- |
-| <kbd>Click</kbd> / <kbd>Enter</kbd> | capture the highlighted element |
-| <kbd>↑</kbd> | widen to the parent (climbs out of slots and shadow roots too) |
-| <kbd>↓</kbd> | narrow back down |
-| <kbd>Esc</kbd> / right-click | quit |
+| <kbd>Click</kbd> | select the highlighted element |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | widen to the parent (climbs out of slots and shadow roots too) / narrow back down |
+| <kbd>←</kbd> / <kbd>→</kbd> | previous / next sibling |
+| <kbd>Enter</kbd> | capture the selection |
+| <kbd>Esc</kbd> | drop the selection; again to quit |
+| right-click | quit |
 
 While you pick, an invisible overlay receives the mouse, so the page never sees your hover or click: links don't navigate, menus don't open, and the element is captured in its resting, un-hovered state.
 
-After a capture you can **Copy again**, **Download .html** (a complete standalone page), **Preview** it in a new tab, or **Pick another**.
+After a capture you can **Adjust selection** (go back and take the parent instead, say), **Copy again**, **Download .html** (a complete standalone page), **Preview** it in a new tab, or **Pick another**.
 
 ### Capturing dropdowns, popovers and dialogs
 

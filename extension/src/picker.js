@@ -13,9 +13,15 @@
  * the top layer above them, and every mouse event is swallowed on `window`
  * before the page's "click outside" handlers can close anything.
  *
- *   click / Enter  capture the highlighted element and copy it
+ * Clicking does not capture straight away: it pins the selection, and a small
+ * panel offers Parent / Child / Previous / Next buttons and the ancestor trail,
+ * so a wrapper that has no pixel of its own to click on can still be reached.
+ *
+ *   click          select the element under the cursor (click elsewhere to change)
  *   ↑ / ↓          widen to the parent / narrow back down
- *   Esc            leave
+ *   ← / →          previous / next sibling
+ *   Enter          capture the selection and copy it
+ *   Esc            drop the selection; again to leave
  */
 (() => {
   'use strict';
@@ -53,12 +59,15 @@
       background: rgba(109, 94, 252, .14); box-shadow: 0 0 0 1px rgba(255, 255, 255, .7), 0 0 0 9999px rgba(15, 23, 42, .08);
       transition: transform .07s ease-out, width .07s ease-out, height .07s ease-out, border-color .2s, background-color .2s;
       will-change: transform, width, height; display: none; }
+    .box.locked { border-color: #f59e0b; background: rgba(245, 158, 11, .14); }
+    .box.peek { border-style: dashed; }
     .box.done { border-color: #10b981; background: rgba(16, 185, 129, .16); }
     .tag { position: fixed; top: 0; left: 0; pointer-events: none; display: none; max-width: min(520px, 90vw);
       font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: #fff; background: #6d5efc; padding: 5px 7px;
       border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
     .tag b { font-weight: 400; opacity: .75; margin-left: 6px; }
-    .bar, .panel { position: fixed; left: 50%; transform: translateX(-50%); color: #e5e7eb; background: rgba(17, 24, 39, .94);
+    .tag.locked { background: #b45309; }
+    .bar, .nav, .panel { position: fixed; left: 50%; transform: translateX(-50%); color: #e5e7eb; background: rgba(17, 24, 39, .94);
       border: 1px solid rgba(255,255,255,.12); box-shadow: 0 12px 40px rgba(0,0,0,.4); backdrop-filter: blur(8px);
       font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
     .bar { bottom: 18px; display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 14px; border-radius: 999px; white-space: nowrap; }
@@ -71,6 +80,18 @@
     button:focus-visible { outline: 2px solid #a5b4fc; outline-offset: 1px; }
     button.primary { background: #6d5efc; color: #fff; }
     button.primary:hover { background: #5b4ee0; }
+    button[disabled] { opacity: .35; cursor: default; }
+    button[disabled]:hover { background: rgba(255,255,255,.1); }
+    .nav { bottom: 68px; display: none; flex-direction: column; align-items: center; gap: 8px; padding: 10px 12px;
+      border-radius: 16px; max-width: calc(100vw - 32px); }
+    .nav.open { display: flex; }
+    .nav .moves { display: flex; gap: 6px; }
+    .crumbs { display: flex; align-items: center; gap: 2px; max-width: 100%; overflow: hidden; color: #6b7280;
+      font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .crumbs button { font: inherit; color: #c4b5fd; background: none; padding: 5px 6px; border-radius: 6px;
+      max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .crumbs button:hover { background: rgba(255,255,255,.12); }
+    .crumbs button.on { color: #fff; background: #b45309; }
     .menu { position: fixed; left: 50%; bottom: 68px; transform: translateX(-50%); width: 320px; padding: 8px; border-radius: 14px;
       color: #e5e7eb; background: rgba(17, 24, 39, .97); border: 1px solid rgba(255,255,255,.12); box-shadow: 0 12px 40px rgba(0,0,0,.4);
       font: 13px/1.35 system-ui, sans-serif; display: none; }
@@ -94,10 +115,20 @@
     @keyframes r { to { transform: rotate(360deg); } }
   `;
 
+  /** Has a box on screen — unlike a <slot> or a display: contents wrapper, which there is nothing to outline of. */
+  const rendered = (n) => n.nodeType === 1 && !n.hasAttribute(DC.UI_ATTR) && n.getClientRects().length > 0;
+  /** The nearest ancestor worth selecting, in the tree as rendered; null above <body>. */
+  const parentOf = (el) => {
+    let up = DC.flatParent(el);
+    while (up && up !== document.body && up !== document.documentElement && !rendered(up)) up = DC.flatParent(up);
+    return up && up !== document.documentElement ? up : null;
+  };
+
   const h = (tag, props = {}, ...children) => {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(props)) {
       if (k === 'class') el.className = v;
+      else if (k === 'onclick') el.__run = v; // called by activate(): no click event ever reaches our UI
       else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v);
     }
@@ -107,8 +138,9 @@
 
   const picker = {
     active: false,
-    mode: 'pick', // pick | busy | done
+    mode: 'pick', // pick (follows the mouse) | select (pinned by a click) | busy | done
     target: null,
+    peek: null, // where the hovered Parent / Child / trail button would take the selection
     trail: [], // elements we climbed up from, so ↓ can go back
     options: { ...defaults },
     point: null,
@@ -149,7 +181,7 @@
       window.removeEventListener('keydown', this.onKey, true);
       for (const type of MOUSE_EVENTS) window.removeEventListener(type, this.onMouse, true);
       this.host?.remove();
-      this.host = this.target = this.result = this.point = null;
+      this.host = this.target = this.peek = this.result = this.point = null;
       this.trail = [];
       if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
       this.blobUrl = null;
@@ -191,14 +223,33 @@
         { class: 'bar' },
         h('span', { class: 'name' }, 'DOM Capture'),
         this.barHint,
-        h('button', { onclick: () => this.menu.classList.toggle('open'), title: 'Capture options' }, 'Options'),
-        h('button', { onclick: () => this.stop(), title: 'Close (Esc)' }, 'Close'),
+        (this.captureButton = h('button', { class: 'primary', 'data-act': 'capture', onclick: () => this.captureTarget(), title: 'Copy the selection (Enter)' }, 'Capture')),
+        h('button', { onclick: () => this.toggleMenu(), title: 'Capture options' }, 'Options'),
+        h('button', { onclick: () => this.stop(), title: 'Close' }, 'Close'),
+      );
+
+      // Shown once something is selected: walk the tree with clicks instead of pixel-hunting.
+      this.moveButtons = {};
+      const move = (act, label, title) => (this.moveButtons[act] = h('button', { 'data-act': act, title, onclick: (button) => this.go(button.__el) }, label));
+      this.crumbs = h('div', { class: 'crumbs' });
+      this.nav = h(
+        'div',
+        { class: 'nav' },
+        h(
+          'div',
+          { class: 'moves' },
+          move('parent', '↑ Parent', 'Select the parent (↑)'),
+          move('child', '↓ Child', 'Select the first child — or go back down the way you came (↓)'),
+          move('prev', '← Previous', 'Select the previous sibling (←)'),
+          move('next', 'Next →', 'Select the next sibling (→)'),
+        ),
+        this.crumbs,
       );
       this.panel = h('div', { class: 'panel', role: 'status' });
 
-      for (const el of [this.catcher, this.box, this.tag, this.menu, this.bar, this.panel]) el.style.pointerEvents = 'auto';
+      for (const el of [this.catcher, this.box, this.tag, this.menu, this.nav, this.bar, this.panel]) el.style.pointerEvents = 'auto';
       this.box.style.pointerEvents = this.tag.style.pointerEvents = 'none';
-      root.append(this.catcher, this.box, this.tag, this.menu, this.bar, this.panel);
+      root.append(this.catcher, this.box, this.tag, this.menu, this.nav, this.bar, this.panel);
       document.documentElement.appendChild(host);
       this.raise();
     },
@@ -233,21 +284,20 @@
 
     setMode(mode) {
       this.mode = mode;
-      this.catcher.classList.toggle('idle', mode !== 'pick');
+      this.peek = null;
+      this.catcher.classList.toggle('idle', mode !== 'pick' && mode !== 'select');
+      this.box.classList.toggle('locked', mode === 'select');
+      this.tag.classList.toggle('locked', mode === 'select');
       this.box.classList.toggle('done', mode === 'done');
       this.bar.style.display = mode === 'done' ? 'none' : 'flex';
+      this.captureButton.style.display = mode === 'select' ? '' : 'none';
+      this.nav.classList.toggle('open', mode === 'select');
       this.panel.classList.toggle('open', mode === 'done');
       this.menu.classList.remove('open');
       if (mode === 'pick') {
-        this.barHint.replaceChildren(
-          'Click an element to copy it  ·  ',
-          h('kbd', {}, '↑'),
-          ' ',
-          h('kbd', {}, '↓'),
-          ' parent / child  ·  ',
-          h('kbd', {}, 'Esc'),
-          ' to quit',
-        );
+        this.barHint.replaceChildren('Click an element to select it  ·  ', h('kbd', {}, 'Esc'), ' to quit');
+      } else if (mode === 'select') {
+        this.barHint.replaceChildren('Adjust the selection, then  ', h('kbd', {}, 'Enter'), '  or');
       } else if (mode === 'busy') {
         this.barHint.replaceChildren(h('span', { class: 'spin' }), 'Capturing styles…');
       }
@@ -265,19 +315,81 @@
       return el && DC.normalizeRoot(el);
     },
 
+    toggleMenu() {
+      this.menu.style.bottom = `${this.mode === 'select' ? 76 + this.nav.offsetHeight : 68}px`; // clear of the selection panel
+      this.menu.classList.toggle('open');
+    },
+
+    /** Pin `el` as the selection and point the Parent / Child / sibling buttons and the trail at its relatives. */
+    select(el) {
+      this.target = el;
+      if (this.mode !== 'select') this.setMode('select');
+      this.peek = null;
+      const moves = this.movesFrom(el);
+      for (const [act, button] of Object.entries(this.moveButtons)) {
+        button.__el = moves[act];
+        button.toggleAttribute('disabled', !moves[act]);
+      }
+      const chain = [];
+      for (let a = el; a; a = parentOf(a)) chain.unshift(a);
+      const shown = chain.slice(innerWidth < 700 ? -3 : -5);
+      this.crumbs.replaceChildren(shown.length < chain.length ? '… › ' : '');
+      for (const a of shown) {
+        const crumb = h('button', { title: DC.describe(a), onclick: () => this.go(a) }, DC.describe(a));
+        crumb.__el = a;
+        if (a === el) crumb.className = 'on';
+        this.crumbs.append(crumb, a === el ? '' : ' › ');
+      }
+    },
+
+    /** Where each step leads from `el` in the tree as rendered (slots resolved, shadow roots entered). */
+    movesFrom(el) {
+      // The first child with a box — looking through boxless wrappers (<slot>, display: contents).
+      const firstBox = (from, depth = 0) => {
+        for (const n of DC.flatChildren(from, {})) {
+          if (rendered(n)) return n;
+          const inner = n.nodeType === 1 && depth < 6 && !n.hasAttribute(DC.UI_ATTR) ? firstBox(n, depth + 1) : null;
+          if (inner) return inner;
+        }
+        return null;
+      };
+      const parent = parentOf(el);
+      let child = this.trail[this.trail.length - 1] || firstBox(el);
+      child = child && DC.normalizeRoot(child); // (snaps back for children of an <svg>)
+      const siblings = parent ? DC.flatChildren(DC.flatParent(el), {}).filter(rendered) : [];
+      const i = siblings.indexOf(el);
+      return { parent, child: child !== el ? child : null, prev: (i > 0 && siblings[i - 1]) || null, next: (i >= 0 && siblings[i + 1]) || null };
+    },
+
+    /** Move the selection to a relative, remembering the way back down when climbing. */
+    go(el) {
+      if (!el || !this.target || el === this.target) return;
+      if (el === this.trail[this.trail.length - 1]) this.trail.pop();
+      else {
+        const climbed = [];
+        let a = this.target;
+        while (a && a !== el) {
+          climbed.push(a);
+          a = parentOf(a);
+        }
+        this.trail = a ? this.trail.concat(climbed) : [];
+      }
+      this.select(el);
+    },
+
     /** The button / checkbox row of our own UI at a point (or just the panel it is in). */
     controlAt(x, y) {
       const inside = (el) => {
         const r = el.getBoundingClientRect();
         return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
       };
-      const layer = [this.menu, this.panel, this.bar].find(inside);
+      const layer = [this.menu, this.panel, this.nav, this.bar].find(inside);
       return layer ? [...layer.querySelectorAll('button, label')].find(inside) || layer : null;
     },
 
     onMouse: (e) => picker.handleMouse(e),
     handleMouse(e) {
-      // Untrusted events are the page's own business — or a click we forwarded below.
+      // Untrusted events are the page's own business.
       if (!e.isTrusted || !this.host) return;
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -295,11 +407,33 @@
       // Our controls are found by geometry, not by event target: behind a modal dialog the overlay
       // is inert and the browser targets the dialog instead.
       const control = this.controlAt(e.clientX, e.clientY);
+      if (e.type === 'mousemove') this.peek = (this.mode === 'select' && control?.__el) || null;
       if (control) {
-        if (e.type === 'click' && control.matches('button, label')) control.click();
+        if (e.type === 'click') this.activate(control);
       } else if (e.type === 'mousemove') this.onMove(e);
-      else if (e.type === 'click' && this.mode === 'pick') this.captureTarget();
+      else if (e.type === 'click') this.onClick(e);
       else if (e.type === 'contextmenu') this.stop();
+    },
+
+    /**
+     * Do what a click on one of our controls would — without dispatching one. A synthetic click is
+     * composed: it would travel through the page's document, where a "click outside" handler
+     * takes it for a reason to close the very dropdown being captured.
+     */
+    activate(control) {
+      if (control.localName === 'label') {
+        const input = control.querySelector('input');
+        input.checked = !input.checked;
+        input.dispatchEvent(new Event('change'));
+      } else if (!control.disabled) control.__run?.(control);
+    },
+
+    onClick(e) {
+      // The first click pins what is highlighted; a later one moves the selection somewhere else.
+      const el = this.mode === 'pick' ? this.target : this.mode === 'select' ? this.elementAt(e.clientX, e.clientY) : null;
+      if (!el) return;
+      if (el !== this.target) this.trail = [];
+      this.select(el);
     },
 
     onMove(e) {
@@ -320,20 +454,18 @@
       };
       if (e.key === 'Escape') {
         swallow();
-        return this.stop();
+        if (this.mode !== 'select') return this.stop();
+        this.setModePick();
+        if (this.point) this.target = this.elementAt(...this.point); // straight back to following the mouse
+        return;
       }
-      if (this.mode !== 'pick' || !this.target) return;
-      if (e.key === 'ArrowUp') {
+      if ((this.mode !== 'pick' && this.mode !== 'select') || !this.target) return;
+      const act = { ArrowUp: 'parent', ArrowDown: 'child', ArrowLeft: 'prev', ArrowRight: 'next' }[e.key];
+      if (act) {
         swallow();
-        const parent = DC.flatParent(this.target);
-        if (parent && parent !== document.documentElement) {
-          this.trail.push(this.target);
-          this.target = parent;
-        }
-      } else if (e.key === 'ArrowDown') {
-        swallow();
-        const child = this.trail.pop() || DC.flatChildren(this.target, {}).find((n) => n.nodeType === 1 && n.getClientRects().length);
-        if (child) this.target = DC.normalizeRoot(child); // (snaps back for children of an <svg>)
+        // Pins the selection too: a nudge of the mouse must not undo the climb.
+        if (this.mode === 'pick') this.select(this.target);
+        this.go(this.moveButtons[act].__el);
       } else if (e.key === 'Enter') {
         swallow();
         this.captureTarget();
@@ -341,7 +473,8 @@
     },
 
     drawBox() {
-      const el = this.target;
+      const el = this.peek || this.target;
+      this.box.classList.toggle('peek', !!this.peek);
       if (!el || !el.isConnected) {
         this.box.style.display = this.tag.style.display = 'none';
         return;
@@ -390,11 +523,12 @@
         'div',
         { class: 'actions' },
         h('button', { class: 'primary', onclick: () => this.setModePick() }, 'Pick another'),
-        h('button', { onclick: (e) => this.recopy(e.currentTarget) }, 'Copy again'),
+        h('button', { onclick: () => this.adjust(), title: 'Back to this selection — to take its parent instead, say' }, 'Adjust selection'),
+        h('button', { onclick: (button) => this.recopy(button) }, 'Copy again'),
         h('button', { onclick: () => this.download() }, 'Download .html'),
         h('button', { onclick: () => this.preview() }, 'Preview'),
-        h('button', { onclick: (e) => this.copyLog(e.currentTarget), title: 'Timeline, options and warnings — handy for bug reports' }, 'Copy debug log'),
-        h('button', { onclick: () => this.stop() }, 'Done'),
+        h('button', { onclick: (button) => this.copyLog(button), title: 'Timeline, options and warnings — handy for bug reports' }, 'Copy debug log'),
+        h('button', { 'data-act': 'done', onclick: () => this.stop() }, 'Done'),
       );
       this.panel.replaceChildren(
         title,
@@ -416,7 +550,7 @@
         h(
           'div',
           { class: 'actions' },
-          h('button', { class: 'primary', onclick: (e) => this.copyLog(e.currentTarget) }, 'Copy debug log'),
+          h('button', { class: 'primary', onclick: (button) => this.copyLog(button) }, 'Copy debug log'),
           h('button', { onclick: () => this.setModePick() }, 'Try another'),
           h('button', { onclick: () => this.stop() }, 'Close'),
         ),
@@ -434,7 +568,14 @@
     setModePick() {
       this.result = null;
       this.target = null;
+      this.trail = [];
       this.setMode('pick');
+    },
+
+    adjust() {
+      if (!this.target?.isConnected) return this.setModePick();
+      this.result = null;
+      this.select(this.target);
     },
 
     async recopy(button) {
