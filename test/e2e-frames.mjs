@@ -53,37 +53,55 @@ async function withExtension(hostPermissions, run) {
     // What background.js does on a toolbar click (which a test cannot make).
     await sw.evaluate(async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['src/capture.js'] });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/picker.js'] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['src/capture.js', 'src/picker.js'] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => globalThis.__domCapturePicker?.toggle() });
     });
     await page.waitForSelector('dom-capture-ui', { state: 'attached' });
     await page.evaluate(() => navigator.clipboard.writeText('nothing yet')); // (the OS clipboard outlives a browser, and '' does not overwrite it)
-    // Select the first iframe, widen to the wrapper around all three, capture.
-    const box = await page.locator('#same').boundingBox();
-    await page.mouse.move(box.x + 20, box.y + 20);
-    await page.mouse.move(box.x + 24, box.y + 24);
-    await page.mouse.click(box.x + 24, box.y + 24);
-    await page.keyboard.press('ArrowUp');
-    await page.keyboard.press('Enter');
-    // Wait on the picker itself (the clipboard is the OS's, and may hold an older capture).
-    const readPanel = () =>
-      sw.evaluate(async () => {
+    // Ask the top frame's picker (its UI is in a closed shadow root, but the object itself can be reached).
+    // No eval in the isolated world: a fixed set of named queries and actions.
+    const inPicker = (what) =>
+      sw.evaluate(async (what) => {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const [{ result }] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: () => {
-            const picker = globalThis.__domCapturePicker;
-            if (picker?.mode !== 'done' || !picker.result) return null;
-            return { text: picker.panel.textContent, allow: !!picker.panel.querySelector('[data-act="allow-frames"]'), blocked: picker.result.blockedFrames, log: picker.log };
+          args: [what],
+          func: (what) => {
+            const p = globalThis.__domCapturePicker;
+            if (what === 'panel') return p?.mode !== 'done' || !p.result ? null : { text: p.panel.textContent, label: p.result.label, allow: !!p.panel.querySelector('[data-act="allow-frames"]'), blocked: p.result.blockedFrames, log: p.log };
+            if (what === 'state') return { mode: p.mode, remote: !!p.remote, chain: p.remote?.state.chain || null, local: p.target ? p.target.localName : null, id: p.target?.id || null };
+            if (what === 'pick') return void p.setModePick();
+            if (what === 'adjust') return void p.adjust();
+            return null;
           },
         });
-        return result;
-      });
-    let panel = null;
-    for (let i = 0; i < 100 && !(panel = await readPanel()); i++) await page.waitForTimeout(200);
-    if (!panel) throw new Error('the capture never finished');
-    const snippet = await page.evaluate(() => navigator.clipboard.readText());
-    await run({ context, page, snippet, panel, sw });
+        return result ?? null;
+      }, what);
+    const readPanel = () => inPicker('panel');
+    // Wait on the picker itself (the clipboard is the OS's, and may hold an older capture).
+    const captured = async () => {
+      let panel = null;
+      for (let i = 0; i < 100 && !(panel = await readPanel()); i++) await page.waitForTimeout(200);
+      if (!panel) throw new Error('the capture never finished');
+      return { panel, snippet: await page.evaluate(() => navigator.clipboard.readText()) };
+    };
+    // Hover a frame (the top picker asks the frame's picker to identify itself, then lets the mouse through), then click in it.
+    const hoverInto = async (sel, dx, dy) => {
+      const box = await page.locator(sel).boundingBox();
+      await page.mouse.move(box.x + dx - 4, box.y + dy);
+      await page.mouse.move(box.x + dx, box.y + dy);
+      await page.waitForTimeout(150);
+      await page.mouse.move(box.x + dx + 1, box.y + dy);
+      await page.mouse.move(box.x + dx, box.y + dy);
+      await page.waitForTimeout(50);
+      return [box.x + dx, box.y + dy];
+    };
+    const clickInto = async (sel, dx, dy) => {
+      const [x, y] = await hoverInto(sel, dx, dy);
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(100);
+    };
+    await run({ context, page, sw, inPicker, captured, hoverInto, clickInto, readPanel });
   } catch (e) {
     check('e2e threw', false, e.stack);
   } finally {
@@ -93,7 +111,21 @@ async function withExtension(hostPermissions, run) {
 }
 
 console.log('\niframes — extension allowed on the frames\' sites');
-await withExtension(['<all_urls>'], async ({ context, page, snippet, panel }) => {
+await withExtension(['<all_urls>'], async ({ context, page, inPicker, captured, clickInto }) => {
+  // Picking inside frames: the heading in the same-origin frame, then up and out to the wrapper.
+  await clickInto('#same', 24, 24);
+  const state = await inPicker('state');
+  check('a click inside a frame selects the element in the frame, not the <iframe>', state.mode === 'select' && state.remote && state.chain?.at(-1) === 'h3.framed-title' && !state.local, JSON.stringify(state));
+  await page.keyboard.press('ArrowUp'); // h3 -> body (in the frame)
+  await page.waitForTimeout(100);
+  await page.keyboard.press('ArrowUp'); // body -> the <iframe> itself, back on the page
+  await page.waitForTimeout(100);
+  const up = await inPicker('state');
+  check('↑ from the frame\'s <body> selects the <iframe> on the page', !up.remote && up.id === 'same', JSON.stringify(up));
+  await page.keyboard.press('ArrowUp'); // -> #wrap
+  await page.waitForTimeout(100);
+  await page.keyboard.press('Enter');
+  const { snippet, panel } = await captured();
   check('the wrapper was captured', snippet.startsWith('<!-- DOM Capture: <div> '), snippet.slice(0, 60));
   const pasted = await context.newPage();
   await pasted.setContent(`<!doctype html><body>${snippet}</body>`);
@@ -119,10 +151,55 @@ await withExtension(['<all_urls>'], async ({ context, page, snippet, panel }) =>
   check('nothing to allow', !panel.allow && panel.blocked.length === 0, JSON.stringify(panel.blocked));
   check('the page never sees a frame\'s contents', !(await page.evaluate(() => window.__leak)));
   await pasted.close();
+
+  // An element inside a cross-origin frame: pick it, capture it, edit it, move it, delete it.
+  await inPicker('pick');
+  await page.bringToFront();
+  await clickInto('#cross', 24, 24);
+  await page.keyboard.press('Enter');
+  const inner = await captured();
+  check('an element inside a cross-origin frame is captured on its own', inner.panel.label === 'h3.framed-title' && inner.snippet.startsWith('<!-- DOM Capture: <h3> ') && inner.snippet.includes('Framed heading') && !inner.snippet.includes('<iframe'), `${inner.panel.label} ${inner.snippet.slice(0, 80)}`);
+  const framedColor = await page.frameLocator('#cross').locator('h3').evaluate((h) => getComputedStyle(h).color);
+  check('…with the frame\'s own styles', inner.snippet.includes(framedColor.replace('rgb(', '').split(',')[0]) || inner.snippet.includes('190, 18, 60'), inner.snippet.slice(-300));
+  await inPicker('adjust');
+  await page.keyboard.press('e');
+  await page.waitForTimeout(100);
+  await page.keyboard.press('ArrowRight'); // (End does not collapse a selection inside a frame in headless Chromium)
+  await page.keyboard.type(' (edited)');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(100);
+  check('E edits text inside the frame', (await page.frameLocator('#cross').locator('h3').textContent()) === 'Framed heading (edited)', await page.frameLocator('#cross').locator('h3').textContent());
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.waitForTimeout(100);
+  check('Shift+↓ moves it within the frame', (await page.frameLocator('#cross').locator('body > :nth-child(1)').evaluate((n) => n.className)) === 'framed-note');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(100);
+  check('…and ⌘Z undoes both, from the top frame\'s undo stack', (await page.frameLocator('#cross').locator('body > :nth-child(1)').textContent()) === 'Framed heading');
+  await page.keyboard.press('Delete');
+  await page.waitForTimeout(100);
+  check('Delete removes it from the frame', (await page.frameLocator('#cross').locator('h3').count()) === 0);
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(100);
+  check('…and comes back with ⌘Z', (await page.frameLocator('#cross').locator('h3').count()) === 1);
+
+  // A frame inside a frame.
+  await inPicker('pick');
+  await clickInto('#nested', 24, 24);
+  await page.keyboard.press('Enter');
+  const deep = await captured();
+  check('an element two frames deep is picked and captured', deep.panel.label === 'h3.framed-title' && deep.snippet.startsWith(`<!-- DOM Capture: <h3> from http://127.0.0.1:${port}/framed.html`) && deep.snippet.includes('Framed heading'), `${deep.panel.label} ${deep.snippet.slice(0, 80)}`);
 });
 
 console.log('\niframes — extension allowed on the page only (activeTab)');
-await withExtension([`${origin}/*`], async ({ context, snippet, panel, sw }) => {
+await withExtension([`${origin}/*`], async ({ context, page, sw, inPicker, captured, clickInto }) => {
+  // No picker can run in the cross-origin frame: it is picked as a whole, like any element.
+  await clickInto('#cross', 24, 24);
+  const whole = await inPicker('state');
+  check('a frame the extension may not enter is selected as a whole', whole.mode === 'select' && !whole.remote && whole.id === 'cross', JSON.stringify(whole));
+  await page.keyboard.press('ArrowUp');
+  await page.keyboard.press('Enter');
+  const { snippet, panel } = await captured();
   const pasted = await context.newPage();
   await pasted.setContent(`<!doctype html><body>${snippet}</body>`);
   check('the same-origin frame is still inlined', (await pasted.locator('iframe[srcdoc]').count()) >= 1 && snippet.includes('Framed heading'), snippet.slice(0, 200));

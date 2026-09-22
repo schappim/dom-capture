@@ -88,7 +88,9 @@ An `<iframe>` is captured together with the document it is showing right now: th
 
 `activeTab` reaches the page and its same-origin frames. A frame from **another site** needs that site granted: the result panel then shows **Allow & capture the iframe too**, Chrome asks once for that site only, and the capture runs again with the frame inlined. Until then the iframe keeps its `src` and the panel says so. A frame's contents go from the frame to the extension and never through `window.postMessage`, so the embedding page cannot use your capture to read a cross-origin frame.
 
-Pick the iframe itself (or anything around it — use **↑ Parent**). Picking a single element *inside* a frame is not supported yet.
+**Picking inside a frame.** Move the mouse into an iframe and the picker follows it in: the element under the cursor is outlined inside the frame, a click selects it, and everything else — **↑ Parent**, the trail, Capture, Edit text, Move (drag or point), Cut, Delete, Undo — works on it exactly as on the page. **↑ Parent** from the frame's `<body>` steps out to the `<iframe>` itself, and on from there. This works for same-origin frames straight away, for a frame from another site once that site is allowed, and for frames inside frames. A frame the extension cannot enter (not allowed, a `data:` URL, a sandboxed frame on some sites) is picked as a whole, as before.
+
+How: the picker is installed in every frame the extension may touch. In a frame it runs headless — just the outline — and the toolbar in the top frame drives it: the top overlay opens a hole over an iframe that has a picker so the mouse reaches it, and the two talk through the extension's background page, never through the page. An element can be moved within its own frame; to take it into the page or another frame, Cut it and Paste it there.
 
 ## What you paste
 
@@ -165,7 +167,7 @@ The log is plain text: extension version, page URL, browser, options, the picked
 - Stylesheets on another origin *without* CORS headers can't be read, so hover rules, keyframes and fonts defined only there are missing — you get a warning naming the sheet. The element's resting appearance is unaffected.
 - Sizing of `::before` / `::after` comes from `getComputedStyle` (pixels) unless a readable stylesheet shows it was `auto` or a percentage.
 - Behind a **modal** `<dialog>` the browser makes everything else inert, the overlay included: picking still works, but the dialog's content does see your `:hover` while you pick.
-- You cannot pick an element *inside* an `<iframe>` — only the iframe (with its whole document, see [Iframes](#iframes)) or something around it. A frame the extension cannot be injected into (a `data:` URL, a sandboxed frame on some sites) keeps its `src`.
+- A frame the extension cannot be injected into (not allowed, a `data:` URL, a sandboxed frame on some sites) can only be picked as a whole, and keeps its `src` in the capture. An element cannot be dragged out of its frame — Cut and Paste instead.
 - `<video>` and `blob:` media keep their URLs.
 - Quirks-mode pages (no doctype) can differ by a few pixels once pasted into a standards-mode file.
 - Moving an element under a different parent pins its computed styles, not its `::before` / `::after` or `:hover` rules; those still follow whatever the new context says. Changes made to a page live only until it is reloaded.
@@ -194,7 +196,7 @@ npm test
 
 **`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog. `edit.html` and `paste-target.html` cover editing text, moving (dragging, pointing, nudging — into gaps, across parents with the look kept, and undone), deleting, and pasting a capture into a page whose own `!important` CSS tries to restyle it.
 
-**`test/e2e-frames.mjs`** captures same-origin, cross-origin and nested iframes (`test/fixtures/frames.html`), pastes the result and compares what the frames show — once with the extension allowed on the frames' site, once with the page's origin only, where the cross-origin frame must keep its `src` and the panel must offer to allow it.
+**`test/e2e-frames.mjs`** captures same-origin, cross-origin and nested iframes (`test/fixtures/frames.html`), pastes the result and compares what the frames show — once with the extension allowed on the frames' site, once with the page's origin only, where the cross-origin frame must keep its `src` and the panel must offer to allow it. It also picks *inside* the frames: selecting, climbing out to the `<iframe>`, capturing, editing, moving, deleting and undoing an element of a cross-origin frame, and one two frames deep.
 
 **`test/real-sites.mjs`** is a manual, network-dependent smoke test. Its targets aren't checked in: copy `test/real-sites.example.json` to `test/real-sites.json` and list your own pages as `["name", "url", "css selector"]`. Screenshots land in `test/output/real/`.
 

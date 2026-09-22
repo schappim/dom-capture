@@ -55,7 +55,8 @@ try {
   const inject = () =>
     sw.evaluate(async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/capture.js', 'src/picker.js'] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['src/capture.js', 'src/picker.js'] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => globalThis.__domCapturePicker?.toggle() });
     });
   const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
   // Polled from here rather than with waitForFunction, which has been seen to come back early.

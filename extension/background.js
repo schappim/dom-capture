@@ -1,11 +1,11 @@
 // Clicking the toolbar button (or Alt+Shift+C) injects the picker into the
 // current tab. `activeTab` means we only ever touch a page the user asked for.
-// picker.js toggles itself off when injected a second time.
+// The scripts install once; the top frame's picker is then toggled on or off.
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   try {
     await injectCapture(tab.id);
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/picker.js'] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => globalThis.__domCapturePicker?.toggle() });
   } catch (err) {
     // Privileged pages (chrome://, the extension gallery, the PDF viewer) cannot be scripted.
     console.warn('DOM Capture cannot run on this page:', err.message);
@@ -16,15 +16,16 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-// capture.js goes into every frame we may touch, so that an <iframe> can be captured with the
-// document it is showing. `activeTab` covers the page and its same-origin frames; a frame from
-// another site needs the user to grant that site (see "allow-frames" below). It is a no-op in a
-// frame that already has it.
+// capture.js and picker.js go into every frame we may touch, so that an <iframe> can be captured
+// with the document it is showing, and elements inside it picked. `activeTab` covers the page and
+// its same-origin frames; a frame from another site needs the user to grant that site (see
+// "allow-frames" below). Both scripts are no-ops in a frame that already has them.
+const SCRIPTS = ['src/capture.js', 'src/picker.js'];
 async function injectCapture(tabId) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/capture.js'] });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: SCRIPTS });
   } catch {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['src/capture.js'] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: SCRIPTS });
   }
 }
 
@@ -34,9 +35,10 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   const tabId = msg?.tabId ?? sender.tab?.id; // (permit.html names the tab it is asking for)
   if (!tabId || typeof msg?.type !== 'string') return;
 
-  // A frame answering its parent's capture request: content scripts cannot talk to each other
-  // directly, and the answer must not travel through the page (window.postMessage).
-  if (msg.type === 'dom-capture:frame') {
+  // A frame answering its parent's capture request, or the pickers in the tab's frames talking to
+  // each other: content scripts cannot talk to each other directly, and none of it must travel
+  // through the page (window.postMessage).
+  if (msg.type === 'dom-capture:frame' || msg.type === 'dom-capture:pick') {
     chrome.tabs.sendMessage(tabId, msg).catch(() => {});
     return;
   }

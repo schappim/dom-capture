@@ -34,17 +34,22 @@
  *   Delete         remove it from the page
  *   X / ⌘X         cut: capture it and take it off this page, to paste on another (any tab or window)
  *   V / ⌘V         paste the last capture: point at where it goes, click to drop
- *   ⌘Z             undo the last edit, move or paste
+ *   ⌘Z             undo the last edit, move, cut, paste or delete
  *   Esc            drop the selection; again to leave
+ *
+ * Iframes: this script goes into every frame the extension may touch. In a frame it runs headless —
+ * only the highlight overlay, no toolbar — and the top frame's picker drives it: hovering an
+ * <iframe> that has one opens a hole in the top overlay so the mouse reaches the frame, whose
+ * picker then hovers, selects, edits and moves its own elements and reports what it did upstairs.
+ * The toolbar's buttons and keys are forwarded to whichever frame holds the selection. Messages
+ * travel through the extension (background relay), never through the page.
  */
 (() => {
   'use strict';
-  if (globalThis.__domCapturePicker) {
-    globalThis.__domCapturePicker.toggle();
-    return;
-  }
+  if (globalThis.__domCapturePicker) return; // installed once; the toolbar button toggles it through toggle()
   const DC = globalThis.__domCapture;
   if (!DC) return;
+  const isTop = window.parent === window;
 
   const OPTION_LABELS = [
     ['states', 'Hover & focus states', 'Carry :hover, :focus and :active rules'],
@@ -256,6 +261,23 @@
   };
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
   const cmd = (e) => (isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey);
+  const isFrame = (el) => el?.localName === 'iframe' && el.namespaceURI === 'http://www.w3.org/1999/xhtml';
+
+  // ------------------------------------------------------------ talking to the pickers in other frames
+  // Every frame's picker has a key. Messages go to the background page, which relays them to every
+  // frame of the tab; each frame keeps the ones addressed to it ('*' is everyone, 'top' the top
+  // frame). A parent learns which key an <iframe> element has by posting a nonce into it: the
+  // frame answers with its key through the relay, so the page in between never reads anything.
+  const PICK_MSG = 'dom-capture:pick';
+  const KEY = crypto.randomUUID();
+  const runtime = globalThis.chrome?.runtime?.id ? chrome.runtime : null;
+  const send = (msg) => {
+    try {
+      runtime?.sendMessage({ type: PICK_MSG, from: KEY, ...msg }, () => void runtime.lastError);
+    } catch {
+      /* extension reloaded under us */
+    }
+  };
 
   const h = (tag, props = {}, ...children) => {
     const el = document.createElement(tag);
@@ -270,9 +292,17 @@
   };
 
   const picker = {
+    ui: isTop, // the top frame has the toolbar and panels; a frame's picker is only the highlight overlay
     active: false,
     mode: 'pick', // pick (follows the mouse) | select (pinned by a click) | edit | place | busy | done
     target: null,
+    remote: null, // top only: { key, state } when the selection lives in a frame's picker
+    hole: null, // the <iframe> the overlay currently lets the mouse through to
+    frameKeys: new WeakMap(), // <iframe> element -> its picker's key
+    keyFrames: new Map(), // key -> <iframe> element
+    nonces: new Map(), // handshake nonce -> <iframe> element
+    owner: false, // frame only: the top says this frame holds the selection
+    inside: false, // frame only: the mouse is in here (the top was told)
     editing: null, // { el, saved, control, hadAttr } while the selection's text is being edited
     placing: null, // { kind: 'move' | 'paste', node?, from, drag } while pointing at where something goes
     press: null, // [x, y] of a mouse-down on the selection: dragging from there moves it
@@ -292,8 +322,10 @@
     },
 
     async start() {
+      if (this.starting || this.host) return;
+      this.starting = true;
       this.active = true;
-      if (storage) {
+      if (storage && this.ui) {
         try {
           Object.assign(this.options, await storage.get(defaults));
         } catch {
@@ -305,20 +337,11 @@
       } catch {
         this.clip = null;
       }
-      if (!this.active) return;
+      this.starting = false;
+      if (!this.active || this.host) return;
       this.build();
       this.setMode('pick');
       window.addEventListener('keydown', this.onKey, true);
-      if (!this.listening) {
-        globalThis.chrome?.runtime?.onMessage?.addListener((msg) => void (msg?.type === 'dom-capture:retry' && this.active && this.mode === 'done' && this.captureTarget()));
-        // A capture made in another tab becomes pasteable here straight away.
-        globalThis.chrome?.storage?.onChanged?.addListener((changes, area) => {
-          if (area !== 'local' || !('clip' in changes)) return;
-          this.clip = changes.clip.newValue || null;
-          if (this.active) this.refreshBar();
-        });
-      }
-      this.listening = true;
       for (const type of MOUSE_EVENTS) window.addEventListener(type, this.onMouse, true);
       const tick = () => {
         if (!this.active) return;
@@ -332,14 +355,15 @@
     stop() {
       if (this.editing) this.endEdit(true); // what was typed stays
       this.active = false;
-      this.placing = this.drop = this.press = null;
-      this.swallowClick = false;
+      this.placing = this.drop = this.press = this.remote = this.hole = null;
+      this.swallowClick = this.owner = this.inside = false;
       cancelAnimationFrame(this.raf);
       window.removeEventListener('keydown', this.onKey, true);
       for (const type of MOUSE_EVENTS) window.removeEventListener(type, this.onMouse, true);
       this.host?.remove();
       this.host = this.target = this.peek = this.result = this.point = null;
       this.trail = [];
+      if (this.ui) this.syncFrames(); // (active: false — the frames' pickers go too)
       if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
       this.blobUrl = null;
     },
@@ -364,6 +388,15 @@
       this.tag = h('div', { class: 'tag' });
       this.ghost = h('div', { class: 'ghost' }); // the element being moved, while pointing at its destination
       this.mark = h('div', { class: 'mark' }); // the insertion line for "before" / "after"
+      this.catcher.style.pointerEvents = 'auto';
+      for (const el of [this.box, this.tag, this.ghost, this.mark]) el.style.pointerEvents = 'none';
+      if (!this.ui) {
+        // A frame's picker: the highlight only. The top frame's toolbar speaks for it.
+        root.append(this.catcher, this.ghost, this.box, this.mark, this.tag);
+        document.documentElement.appendChild(host);
+        this.raise();
+        return;
+      }
 
       this.menu = h('div', { class: 'menu' });
       for (const [key, title, help] of OPTION_LABELS) {
@@ -391,7 +424,7 @@
 
       // Shown once something is selected: walk the tree with clicks instead of pixel-hunting.
       this.moveButtons = {};
-      const move = (act, label, title) => (this.moveButtons[act] = h('button', { 'data-act': act, title, onclick: (button) => this.go(button.__el) }, label));
+      const move = (act, label, title) => (this.moveButtons[act] = h('button', { 'data-act': act, title, onclick: (button) => (button.__el ? this.go(button.__el) : this.goRemote(act)) }, label));
       this.crumbs = h('div', { class: 'crumbs' });
       this.nav = h(
         'div',
@@ -416,8 +449,7 @@
       );
       this.panel = h('div', { class: 'panel', role: 'status' });
 
-      for (const el of [this.catcher, this.menu, this.nav, this.bar, this.panel]) el.style.pointerEvents = 'auto';
-      for (const el of [this.box, this.tag, this.ghost, this.mark]) el.style.pointerEvents = 'none';
+      for (const el of [this.menu, this.nav, this.bar, this.panel]) el.style.pointerEvents = 'auto';
       root.append(this.catcher, this.ghost, this.box, this.mark, this.tag, this.menu, this.nav, this.bar, this.panel);
       document.documentElement.appendChild(host);
       this.raise();
@@ -451,7 +483,8 @@
       this.raise();
     },
 
-    setMode(mode) {
+    setMode(mode, { quiet = false } = {}) {
+      const was = this.mode;
       this.mode = mode;
       this.peek = null;
       this.catcher.classList.toggle('idle', !['pick', 'select', 'place'].includes(mode));
@@ -471,6 +504,10 @@
         this.drop = null;
       }
       if (mode !== 'select') this.catcher.classList.remove('grab');
+      if (!this.ui) {
+        if (!quiet && mode !== 'select' && mode !== 'busy' && (mode !== was || mode === 'place')) this.report(); // (select() reports itself, with its moves)
+        return;
+      }
       this.bar.style.display = mode === 'done' ? 'none' : 'flex';
       this.captureButton.style.display = mode === 'select' ? '' : 'none';
       this.refreshBar();
@@ -491,10 +528,26 @@
       } else if (mode === 'busy') {
         this.barHint.replaceChildren(h('span', { class: 'spin' }), 'Capturing styles…');
       }
+      this.syncFrames();
+    },
+
+    /** Top only: tell every frame's picker what is going on, so it can follow (or stay out of the way). */
+    syncFrames() {
+      if (!this.ui) return;
+      send({
+        to: '*',
+        cmd: 'sync',
+        active: this.active,
+        mode: this.mode,
+        placing: this.placing ? { kind: this.placing.kind, drag: !!this.placing.drag } : null,
+        owner: this.remote?.key || null,
+        options: this.options,
+      });
     },
 
     /** The Paste and Undo buttons come and go with what there is to paste and to undo. */
     refreshBar() {
+      if (!this.ui) return;
       const idle = this.mode === 'pick' || this.mode === 'select';
       this.pasteButton.style.display = idle && this.clip ? '' : 'none';
       if (this.clip) {
@@ -523,11 +576,26 @@
     },
 
     /** Pin `el` as the selection and point the Parent / Child / sibling buttons and the trail at its relatives. */
-    select(el) {
+    select(el, { quiet = false } = {}) {
       this.target = el;
-      if (this.mode !== 'select') this.setMode('select');
+      if (this.remote) {
+        // The selection comes back to this document: the frame that had it lets go.
+        send({ to: this.remote.key, cmd: 'drop' });
+        this.remote = null;
+        try {
+          window.focus();
+        } catch {
+          /* fine */
+        }
+      }
+      if (this.mode !== 'select') this.setMode('select', { quiet: true });
       this.peek = null;
       const moves = this.movesFrom(el);
+      if (!this.ui) {
+        if (!quiet) this.report(moves);
+        return;
+      }
+      this.syncFrames();
       for (const [act, button] of Object.entries(this.moveButtons)) {
         button.__el = moves[act];
         button.toggleAttribute('disabled', !moves[act]);
@@ -536,13 +604,272 @@
       this.refreshBar();
       const chain = [];
       for (let a = el; a; a = parentOf(a)) chain.unshift(a);
-      const shown = chain.slice(innerWidth < 700 ? -3 : -5);
-      this.crumbs.replaceChildren(shown.length < chain.length ? '… › ' : '');
-      for (const a of shown) {
-        const crumb = h('button', { title: DC.describe(a), onclick: () => this.go(a) }, DC.describe(a));
-        crumb.__el = a;
-        if (a === el) crumb.className = 'on';
-        this.crumbs.append(crumb, a === el ? '' : ' › ');
+      this.renderCrumbs(chain.map((a) => [DC.describe(a), () => this.go(a), a === el, a]));
+    },
+
+    /** The ancestor trail under the buttons: [label, action, current, element?] per step, the last few of them. */
+    renderCrumbs(steps) {
+      const shown = steps.slice(innerWidth < 700 ? -3 : -5);
+      this.crumbs.replaceChildren(shown.length < steps.length ? '… › ' : '');
+      shown.forEach(([label, run, on, el], i) => {
+        const crumb = h('button', { title: label, onclick: run }, label);
+        if (el) crumb.__el = el;
+        if (on) crumb.className = 'on';
+        this.crumbs.append(crumb, i === shown.length - 1 ? '' : ' › ');
+      });
+    },
+
+    // ------------------------------------------------------------ frames: the top side
+
+    /** Top: the selection is in a frame — the toolbar now speaks for that frame's picker. */
+    adoptRemote(key, state) {
+      this.target = null;
+      this.trail = [];
+      this.placing = this.editing = null;
+      this.remote = { key, state };
+      this.setMode('select');
+      this.renderRemote();
+    },
+
+    renderRemote() {
+      const { key, state } = this.remote;
+      const frameEl = this.keyFrames.get(key) || this.hole; // (a frame inside a frame: the outer one)
+      for (const [act, button] of Object.entries(this.moveButtons)) {
+        button.__el = null;
+        let ok = !!state.moves[act];
+        if (act === 'parent' && !ok && frameEl?.isConnected) {
+          button.__el = frameEl; // above the frame's <body> comes the <iframe> itself, on this page
+          ok = true;
+        }
+        button.toggleAttribute('disabled', !ok);
+      }
+      this.editButton.toggleAttribute('disabled', !state.editable);
+      this.refreshBar();
+      const steps = [];
+      if (frameEl?.isConnected) for (let a = frameEl; a; a = parentOf(a)) steps.unshift([DC.describe(a), () => this.go(a), false, a]);
+      state.chain.forEach((label, i) => steps.push([label, () => send({ to: key, cmd: 'crumb', index: i }), i === state.chain.length - 1]));
+      this.renderCrumbs(steps);
+    },
+
+    goRemote(act) {
+      if (this.remote) send({ to: this.remote.key, cmd: 'go', act });
+    },
+
+    /**
+     * The mouse is over an <iframe>. If a picker of ours answers from inside it, the overlay lets
+     * the mouse through to it (a hole) and that picker takes over; until it answers — or if it
+     * never does, because the extension may not run there — the iframe is an element like any other.
+     */
+    enterFrame(el) {
+      const key = this.frameKeys.get(el);
+      if (!key) {
+        if (![...this.nonces.values()].includes(el)) {
+          const nonce = crypto.randomUUID();
+          this.nonces.set(nonce, el);
+          setTimeout(() => this.nonces.delete(nonce), 3000);
+          try {
+            el.contentWindow.postMessage({ [PICK_MSG]: nonce }, '*');
+          } catch {
+            this.nonces.delete(nonce);
+          }
+        }
+        return false;
+      }
+      if (this.hole !== el) {
+        this.hole = el;
+        this.catcher.style.pointerEvents = 'none';
+        if (this.mode === 'pick') this.target = null;
+        if (this.ui) this.syncFrames(); // (the frame may have been installed after the last sync)
+      }
+      return true;
+    },
+
+    leaveFrame() {
+      if (!this.hole) return;
+      const key = this.frameKeys.get(this.hole);
+      this.hole = null;
+      if (this.mode !== 'edit') this.catcher.style.pointerEvents = 'auto';
+      if (key) send({ to: key, cmd: 'leave' });
+    },
+
+    /** Top: something a frame's picker reported. */
+    onEvent(msg) {
+      const { event, from } = msg;
+      if (event === 'hello') {
+        const el = this.nonces.get(msg.nonce);
+        if (!el) return;
+        this.nonces.delete(msg.nonce);
+        this.frameKeys.set(el, from);
+        this.keyFrames.set(from, el);
+        return;
+      }
+      if (!this.ui || !this.active) return;
+      if (event === 'enter') {
+        if (this.mode === 'pick') this.target = null; // the frame draws its own box now
+        return;
+      }
+      if (event === 'state') {
+        const st = msg.state;
+        const mine = this.remote?.key === from;
+        if (st.mode === 'select') {
+          this.adoptRemote(from, st);
+        } else if (st.mode === 'pick') {
+          if (mine) {
+            this.remote = null;
+            if (this.mode === 'place') this.placing = null;
+            this.setModePick();
+          } else if (this.mode === 'place' && this.placing?.kind === 'paste' && !this.placing.drag) this.cancelPlace(); // a frame's Esc while pasting
+        } else if (st.mode === 'edit' && mine) {
+          this.remote.state = st;
+          this.setMode('edit');
+        } else if (st.mode === 'place' && (mine || st.kind === 'paste')) {
+          if (mine) this.remote.state = st;
+          this.placing = { kind: st.kind, node: null, from: mine ? 'select' : 'pick', drag: !!st.drag, remote: from };
+          this.press = null;
+          this.setMode('place');
+        }
+        return;
+      }
+      if (event === 'did') {
+        this.undos.push({ what: msg.what, frame: from });
+        this.refreshBar();
+      } else if (event === 'undo') this.undo();
+      else if (event === 'stop') this.stop();
+      else if (event === 'key') this.handleKey({ ...msg.key, preventDefault() {}, stopImmediatePropagation() {} });
+      else if (event === 'result') this.takeResult(msg.result, msg.cut);
+      else if (event === 'error') this.showError(Object.assign(new Error(msg.message), { debugLog: msg.debugLog }));
+    },
+
+    /** A frame's picker captured its selection: copy, keep and show it exactly as for one of our own. */
+    async takeResult(result, cut) {
+      this.result = result;
+      this.log = result.debugLog;
+      const copied = await copyText(result.snippet);
+      if (!copied) this.log += '\n\n--- clipboard ---\nwriteText and execCommand("copy") both failed';
+      result.kept = await this.saveClip(result);
+      result.cut = cut;
+      if (this.active) this.showResult(result, copied);
+    },
+
+    // ------------------------------------------------------------ frames: the frame side
+
+    /** Frame: what the top needs to know to speak for this picker. */
+    report(moves) {
+      const el = this.target?.isConnected ? this.target : null;
+      const m = el && (moves || this.movesFrom(el));
+      const chain = [];
+      for (let a = el; a; a = parentOf(a)) chain.unshift(DC.describe(a));
+      send({
+        to: 'top',
+        event: 'state',
+        state: {
+          mode: this.mode,
+          desc: el && DC.describe(el),
+          chain,
+          moves: m ? { parent: !!m.parent, child: !!m.child, prev: !!m.prev, next: !!m.next } : {},
+          editable: !!el && editable(el),
+          kind: this.placing?.kind || null,
+          drag: !!this.placing?.drag,
+        },
+      });
+    },
+
+    /** Frame: a command from the top frame's toolbar or keys. */
+    onCommand(msg) {
+      const { cmd } = msg;
+      if (cmd === 'sync') return this.onSync(msg);
+      if (!this.active) return;
+      switch (cmd) {
+        case 'leave':
+          this.inside = false;
+          if (this.mode === 'pick') this.target = null;
+          else if (this.mode === 'place') this.drop = null;
+          break;
+        case 'drop':
+          if (this.editing) this.endEdit(true);
+          this.placing = null;
+          this.setModePick({ quiet: true });
+          break;
+        case 'go':
+          if (this.target) this.go(this.movesFrom(this.target)[msg.act]);
+          break;
+        case 'crumb': {
+          const chain = [];
+          for (let a = this.target; a; a = parentOf(a)) chain.unshift(a);
+          if (chain[msg.index]) this.go(chain[msg.index]);
+          break;
+        }
+        case 'capture':
+          this.options = msg.options || this.options;
+          this.captureTarget({ cut: !!msg.cut });
+          break;
+        case 'edit':
+          this.startEdit();
+          break;
+        case 'commit':
+          this.commitEdit();
+          break;
+        case 'cancelEdit':
+          this.cancelEdit();
+          break;
+        case 'move':
+          this.startPlace('move');
+          break;
+        case 'cancel':
+          if (this.mode === 'place') this.cancelPlace();
+          break;
+        case 'release':
+          if (this.placing?.drag) this.drop ? this.confirmDrop() : this.cancelPlace();
+          break;
+        case 'nudge':
+          this.nudge(msg.dir);
+          break;
+        case 'delete':
+          this.removeNode();
+          break;
+        case 'undo':
+          this.undo();
+          break;
+      }
+    },
+
+    /** Frame: follow the top frame's mode — pick along, point at where to paste, or stay out of the way. */
+    onSync(msg) {
+      if (!msg.active) return void (this.active && this.stop());
+      this.options = { ...this.options, ...(msg.options || {}) };
+      if (!this.active) {
+        this.start();
+        return; // (start() is async: the next sync catches up)
+      }
+      if (!this.host) return;
+      this.owner = msg.owner === KEY;
+      const kind = msg.placing?.kind;
+      if (msg.mode === 'place' && kind === 'paste') {
+        if (this.mode !== 'place' || this.placing?.kind !== 'paste') {
+          if (this.editing) this.endEdit(true);
+          this.placing = { kind: 'paste', node: null, from: this.owner && this.mode === 'select' ? 'select' : 'pick', drag: false };
+          this.setMode('place', { quiet: true });
+        }
+        return;
+      }
+      if (msg.mode === 'place' && kind === 'move' && !(this.owner && this.mode === 'place')) {
+        // Something on another page (or in another frame) is on the move: nothing can land here.
+        if (this.mode !== 'place') {
+          this.placing = { kind: 'move', node: null, from: this.owner && this.mode === 'select' ? 'select' : 'pick', drag: false, foreign: true };
+          this.setMode('place', { quiet: true });
+        }
+        return;
+      }
+      if (msg.mode !== 'place' && this.mode === 'place' && (this.placing?.foreign || this.placing?.kind === 'paste')) {
+        const { from } = this.placing;
+        this.placing = null;
+        if (from === 'select' && this.owner && this.target?.isConnected) this.select(this.target, { quiet: true });
+        else this.setModePick({ quiet: true });
+      }
+      if (!this.owner && (this.mode === 'select' || this.mode === 'edit' || (this.mode === 'place' && this.placing?.kind === 'move'))) {
+        if (this.editing) this.endEdit(true);
+        this.placing = null;
+        this.setModePick({ quiet: true });
       }
     },
 
@@ -567,7 +894,12 @@
 
     /** Move the selection to a relative, remembering the way back down when climbing. */
     go(el) {
-      if (!el || !this.target || el === this.target) return;
+      if (!el) return;
+      if (this.remote) {
+        this.trail = []; // coming out of a frame: the <iframe> (or an ancestor of it) on this page
+        return this.select(el);
+      }
+      if (!this.target || el === this.target) return;
       if (el === this.trail[this.trail.length - 1]) this.trail.pop();
       else {
         const climbed = [];
@@ -583,6 +915,7 @@
 
     /** The button / checkbox row of our own UI at a point (or just the panel it is in). */
     controlAt(x, y) {
+      if (!this.ui) return null;
       const inside = (el) => {
         const r = el.getBoundingClientRect();
         return r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
@@ -624,7 +957,8 @@
         this.press = null;
         if (this.placing?.drag) {
           this.swallowClick = true; // the click that follows this release is not a new selection
-          this.drop ? this.confirmDrop() : this.cancelPlace();
+          if (this.placing.remote) send({ to: this.placing.remote, cmd: 'release' }); // a drag that started in a frame, released out here
+          else this.drop ? this.confirmDrop() : this.cancelPlace();
           return;
         }
       }
@@ -636,7 +970,7 @@
         if (e.type === 'click') this.activate(control);
       } else if (e.type === 'mousemove') this.onMove(e);
       else if (e.type === 'click') this.mode === 'place' ? this.confirmDrop() : this.onClick(e);
-      else if (e.type === 'contextmenu') this.mode === 'place' ? this.cancelPlace() : this.stop();
+      else if (e.type === 'contextmenu') this.mode === 'place' ? this.cancelPlace() : this.ui ? this.stop() : send({ to: 'top', event: 'stop' });
     },
 
     onTarget(x, y) {
@@ -648,9 +982,11 @@
     handleEditMouse(e) {
       const control = this.controlAt(e.clientX, e.clientY);
       if (!control) {
-        const r = this.editing.el.getBoundingClientRect();
-        const onIt = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
-        if (onIt || e.composedPath().includes(this.editing.el)) return;
+        // The element being edited — or, for a frame's element, the frame — gets the mouse.
+        const el = this.editing?.el || (this.remote && (this.keyFrames.get(this.remote.key) || this.hole));
+        const r = el?.isConnected && el.getBoundingClientRect();
+        const onIt = r && e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+        if (onIt || (this.editing && e.composedPath().includes(this.editing.el))) return;
       }
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -682,6 +1018,14 @@
 
     onMove(e) {
       this.point = [e.clientX, e.clientY];
+      if (!this.ui && !this.inside) {
+        this.inside = true;
+        send({ to: 'top', event: 'enter' });
+      }
+      // Over an <iframe> with a picker of ours inside: open the overlay there and let it take over.
+      const under = this.elementAt(e.clientX, e.clientY);
+      if (isFrame(under) && !this.press && ['pick', 'select', 'place'].includes(this.mode) && this.enterFrame(under)) return;
+      this.leaveFrame();
       if (this.mode === 'place') {
         this.drop = this.dropAt(e.clientX, e.clientY);
         return;
@@ -715,7 +1059,7 @@
         e.stopImmediatePropagation();
       };
       if (this.mode === 'edit') {
-        const textarea = this.editing.el.localName === 'textarea';
+        const textarea = this.editing?.el.localName === 'textarea';
         if (e.key === 'Escape') {
           swallow();
           this.cancelEdit();
@@ -737,7 +1081,7 @@
       }
       if (e.key === 'Escape') {
         swallow();
-        if (this.mode !== 'select') return this.stop();
+        if (this.mode !== 'select') return this.ui ? this.stop() : send({ to: 'top', event: 'stop' });
         this.setModePick();
         if (this.point) this.target = this.elementAt(...this.point); // straight back to following the mouse
         return;
@@ -747,38 +1091,48 @@
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       if (cmd(e) && key === 'z' && !e.shiftKey) {
         swallow();
-        return this.undo();
+        return this.ui ? this.undo() : send({ to: 'top', event: 'undo' });
       }
       if ((plain && key === 'v') || (cmd(e) && key === 'v')) {
         swallow();
         return this.startPlace('paste');
       }
-      if (!this.target) return;
+      if (!this.target) {
+        // A frame with nothing under the mouse or selected: the key is for the top frame's selection.
+        if (!this.ui && this.mode === 'pick') send({ to: 'top', event: 'key', key: { key: e.key, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey, altKey: e.altKey } });
+        if (!this.remote) return;
+      }
       const act = { ArrowUp: 'parent', ArrowDown: 'child', ArrowLeft: 'prev', ArrowRight: 'next' }[e.key];
       if (act) {
         swallow();
         // Pins the selection too: a nudge of the mouse must not undo the climb.
-        if (this.mode === 'pick') this.select(this.target);
+        if (this.mode === 'pick' && this.target) this.select(this.target);
         if (e.shiftKey) this.nudge(act === 'parent' || act === 'prev' ? -1 : 1); // Shift: move the element itself past a sibling
-        else this.go(this.moveButtons[act].__el);
+        else if (this.remote) this.moveButtons[act].__el ? this.go(this.moveButtons[act].__el) : this.goRemote(act);
+        else {
+          const to = this.movesFrom(this.target)[act];
+          // A frame at its <body>: the next parent up is the <iframe> itself, which the top frame selects.
+          if (!to && act === 'parent' && !this.ui) send({ to: 'top', event: 'key', key: { key: e.key, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false } });
+          else this.go(to);
+        }
       } else if (e.key === 'Enter' || (cmd(e) && key === 'c')) {
         swallow();
         this.captureTarget();
       } else if ((plain && key === 'x') || (cmd(e) && key === 'x')) {
         swallow();
-        if (this.mode === 'pick') this.select(this.target);
+        if (this.mode === 'pick' && this.target) this.select(this.target);
         this.captureTarget({ cut: true });
       } else if (plain && (e.key === 'Delete' || e.key === 'Backspace')) {
         swallow();
-        if (this.mode === 'pick') this.select(this.target);
+        if (this.mode === 'pick' && this.target) this.select(this.target);
         this.removeNode();
       } else if (plain && key === 'e') {
         swallow();
-        if (this.mode === 'pick') this.select(this.target);
+        if (this.mode === 'pick' && this.target) this.select(this.target);
         this.startEdit();
       } else if (plain && key === 'm') {
         swallow();
-        if (this.mode === 'pick') this.select(this.target);
+        if (this.mode === 'pick' && this.target) this.select(this.target);
         this.startPlace('move');
       }
     },
@@ -786,6 +1140,7 @@
     // ------------------------------------------------------------ editing the text in place
 
     startEdit() {
+      if (this.remote) return send({ to: this.remote.key, cmd: 'edit' });
       const el = this.target;
       if (!el?.isConnected || !editable(el) || this.mode === 'edit') return;
       const control = isTextControl(el);
@@ -834,17 +1189,24 @@
     },
 
     commitEdit() {
-      if (!this.editing) return;
+      if (!this.editing) return void (this.remote && send({ to: this.remote.key, cmd: 'commit' }));
       const { el, saved, control } = this.endEdit(true);
       const same = control ? el.value === saved : saved.length === el.childNodes.length && saved.every((n, i) => n.isEqualNode(el.childNodes[i]));
-      if (!same) this.undos.push({ what: 'edit', undo: () => (control ? (el.value = saved) : el.replaceChildren(...saved)) });
+      if (!same) this.did('edit', () => (control ? (el.value = saved) : el.replaceChildren(...saved)));
       this.select(el);
     },
 
     cancelEdit() {
-      if (!this.editing) return;
+      if (!this.editing) return void (this.remote && send({ to: this.remote.key, cmd: 'cancelEdit' }));
       const { el } = this.endEdit(false);
       this.select(el);
+    },
+
+    /** Remember how to undo something just done to this document (and, from a frame, tell the top so Undo stays in order). */
+    did(what, undo) {
+      this.undos.push({ what, undo });
+      if (!this.ui) send({ to: 'top', event: 'did', what });
+      else this.refreshBar();
     },
 
     // ------------------------------------------------------------ moving and pasting
@@ -853,6 +1215,7 @@
     startPlace(kind, { drag = false } = {}) {
       if (this.mode !== 'pick' && this.mode !== 'select') return;
       if (kind === 'paste' && !this.clip) return;
+      if (kind === 'move' && this.remote) return send({ to: this.remote.key, cmd: 'move' });
       if (kind === 'move' && !this.target?.isConnected) return;
       this.placing = { kind, node: kind === 'move' ? this.target : null, from: this.mode, drag, grabbed: drag && this.press ? this.press.slice(0, 2) : null };
       this.press = null;
@@ -864,24 +1227,30 @@
 
     /** Take the selection off the page (Undo brings it back). */
     removeNode() {
+      if (this.remote) return send({ to: this.remote.key, cmd: 'delete' });
       const el = this.target;
       if (!el?.isConnected || el === document.body || this.mode !== 'select') return;
       const parent = el.parentNode;
       const next = el.nextSibling;
       const up = parentOf(el);
       el.remove();
-      this.undos.push({ what: 'delete', undo: () => parent.insertBefore(el, next?.parentNode === parent ? next : null) });
+      this.did('delete', () => parent.insertBefore(el, next?.parentNode === parent ? next : null));
       this.trail = [];
       if (up?.isConnected) this.select(up);
       else this.setModePick();
     },
 
     cancelPlace() {
-      const { node, from, drag } = this.placing || {};
+      const { node, from, drag, remote } = this.placing || {};
       if (drag) this.swallowClick = true; // (the button is still down: its release must not reselect)
       this.placing = null;
+      if (remote && this.ui) {
+        send({ to: remote, cmd: 'cancel' });
+        if (this.remote) return this.adoptRemote(this.remote.key, this.remote.state);
+      }
       if (from === 'select' && node?.isConnected) this.select(node);
       else if (from === 'select' && this.target?.isConnected) this.select(this.target);
+      else if (from === 'select' && this.remote) this.adoptRemote(this.remote.key, this.remote.state);
       else this.setModePick();
     },
 
@@ -890,6 +1259,7 @@
       const el = this.elementAt(x, y);
       if (!el) return null;
       const moving = this.placing?.node;
+      if (this.placing?.kind === 'move' && !moving) return null; // what is on the move lives in another document
       if (moving && within(moving, el)) return null; // nothing can go inside itself
       // Over a container — a list, a stack, a flex row — the drop goes into the nearest gap between
       // its children, so a spot in the padding or between two items means exactly that.
@@ -940,12 +1310,9 @@
       const before = dest !== parent ? snapshotStyles(node) : null;
       put([node], ref, where);
       const pinned = before ? pinStyles(before) : [];
-      this.undos.push({
-        what: 'move',
-        undo: () => {
-          for (const [el, css] of pinned) el.style.cssText = css;
-          parent.insertBefore(node, next?.parentNode === parent ? next : null);
-        },
+      this.did('move', () => {
+        for (const [el, css] of pinned) el.style.cssText = css;
+        return parent.insertBefore(node, next?.parentNode === parent ? next : null);
       });
       this.trail = [];
       this.select(node);
@@ -953,6 +1320,7 @@
 
     /** Shift+↑ / Shift+↓: swap the selection with the sibling before / after it. */
     nudge(dir) {
+      if (this.remote) return send({ to: this.remote.key, cmd: 'nudge', dir });
       const el = this.target;
       if (!el?.isConnected) return;
       const moves = this.movesFrom(el);
@@ -983,12 +1351,9 @@
       }
       scope.adoptedStyleSheets = [...scope.adoptedStyleSheets, sheet];
       put(nodes, ref, where);
-      this.undos.push({
-        what: 'paste',
-        undo: () => {
-          for (const n of nodes) n.remove();
-          scope.adoptedStyleSheets = scope.adoptedStyleSheets.filter((s) => s !== sheet);
-        },
+      this.did('paste', () => {
+        for (const n of nodes) n.remove();
+        scope.adoptedStyleSheets = scope.adoptedStyleSheets.filter((s) => s !== sheet);
       });
       this.trail = [];
       this.select(nodes[0]);
@@ -997,12 +1362,18 @@
     undo() {
       const last = this.undos.pop();
       if (!last) return;
+      if (last.frame) {
+        send({ to: last.frame, cmd: 'undo' }); // it happened in a frame: that picker undoes it and reports
+        return this.refreshBar();
+      }
+      let back = null;
       try {
-        last.undo();
+        back = last.undo(); // (putting a node back returns it)
       } catch (err) {
         console.warn('[DOM Capture] could not undo:', err);
       }
-      if (this.mode === 'select' && this.target?.isConnected) this.select(this.target);
+      if (back instanceof Node && back.isConnected && back.nodeType === 1) this.select(back);
+      else if (this.mode === 'select' && this.target?.isConnected) this.select(this.target);
       else this.setModePick();
       this.refreshBar();
     },
@@ -1031,7 +1402,7 @@
 
     drawBox() {
       if (this.mode === 'place') return this.drawDrop();
-      const el = this.peek || this.target;
+      const el = this.peek || (this.remote ? null : this.target); // (a frame's selection is drawn by the frame)
       this.box.classList.toggle('peek', !!this.peek);
       if (!el || !el.isConnected) {
         this.box.style.display = this.tag.style.display = 'none';
@@ -1086,9 +1457,13 @@
     },
 
     async captureTarget({ cut = false } = {}) {
+      if (this.remote) {
+        this.setMode('busy');
+        return send({ to: this.remote.key, cmd: 'capture', cut, options: this.options });
+      }
       const el = this.target;
       if (!el?.isConnected) return;
-      this.setMode('busy');
+      this.setMode('busy', { quiet: true });
       // Let the "Capturing…" state paint before the synchronous style walk.
       await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
       try {
@@ -1096,22 +1471,40 @@
         await ask({ type: 'dom-capture:refresh-frames' }, 1500);
         const result = (this.result = await DC.capture(el, this.options));
         this.log = result.debugLog;
-        const copied = await copyText(result.snippet);
-        if (!copied) this.log += '\n\n--- clipboard ---\nwriteText and execCommand("copy") both failed';
-        result.kept = await this.saveClip(result);
-        if (cut && el.isConnected && el !== document.body) {
+        const takeOff = () => {
           // Off this page, and kept — Undo brings it back here, V puts it on any other page.
           const parent = el.parentNode;
           const next = el.nextSibling;
           el.remove();
-          this.undos.push({ what: 'cut', undo: () => parent.insertBefore(el, next?.parentNode === parent ? next : null) });
+          this.did('cut', () => parent.insertBefore(el, next?.parentNode === parent ? next : null));
+        };
+        if (!this.ui) {
+          // A frame: the top frame copies, keeps and shows it.
+          const { snippet, page, label, stats, warnings, notes, debugLog, blockedFrames } = result;
+          const doCut = cut && el.isConnected && el !== document.body;
+          if (doCut) takeOff();
+          send({ to: 'top', event: 'result', result: { snippet, page, label, stats, warnings, notes: notes || [], debugLog, blockedFrames: blockedFrames || [] }, cut: doCut });
+          if (doCut) this.setModePick({ quiet: true });
+          else this.setMode('select', { quiet: true });
+          return;
+        }
+        const copied = await copyText(result.snippet);
+        if (!copied) this.log += '\n\n--- clipboard ---\nwriteText and execCommand("copy") both failed';
+        result.kept = await this.saveClip(result);
+        if (cut && el.isConnected && el !== document.body) {
+          takeOff();
           result.cut = true;
         }
         if (!this.active) return;
         this.showResult(result, copied);
       } catch (err) {
         console.error('[DOM Capture]', err);
-        if (this.active) this.showError(err);
+        if (!this.active) return;
+        if (this.ui) this.showError(err);
+        else {
+          send({ to: 'top', event: 'error', message: String(err?.message || err), debugLog: err?.debugLog || String(err?.stack || err) });
+          this.setMode('select', { quiet: true });
+        }
       }
     },
 
@@ -1123,7 +1516,7 @@
         'div',
         { class: 'actions' },
         h('button', { class: 'primary', onclick: () => this.setModePick() }, 'Pick another'),
-        result.cut ? h('button', { onclick: () => (this.undo(), this.setModePick()), title: 'Put it back where it was' }, 'Undo cut') : h('button', { onclick: () => this.adjust(), title: 'Back to this selection — to take its parent instead, say' }, 'Adjust selection'),
+        result.cut ? h('button', { onclick: () => this.undo(), title: 'Put it back where it was' }, 'Undo cut') : h('button', { onclick: () => this.adjust(), title: 'Back to this selection — to take its parent instead, say' }, 'Adjust selection'),
         h('button', { onclick: (button) => this.recopy(button) }, 'Copy again'),
         h('button', { onclick: () => this.download() }, 'Download .html'),
         h('button', { onclick: () => this.preview() }, 'Preview'),
@@ -1188,14 +1581,19 @@
       setTimeout(() => (button.textContent = label), 1500);
     },
 
-    setModePick() {
+    setModePick({ quiet = false } = {}) {
       this.result = null;
       this.target = null;
       this.trail = [];
-      this.setMode('pick');
+      if (this.remote) {
+        send({ to: this.remote.key, cmd: 'drop' });
+        this.remote = null;
+      }
+      this.setMode('pick', { quiet });
     },
 
     adjust() {
+      if (this.remote) return this.adoptRemote(this.remote.key, this.remote.state);
       if (!this.target?.isConnected) return this.setModePick();
       this.result = null;
       this.select(this.target);
@@ -1251,6 +1649,32 @@
     return ok;
   }
 
+  // Messages: relayed picker traffic, the retry after "Allow", and a capture made in another tab.
+  runtime?.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === PICK_MSG) {
+      if (msg.from === KEY) return;
+      if (msg.to === 'top' || msg.event === 'hello') {
+        if (isTop || msg.event === 'hello') picker.onEvent(msg);
+      } else if (msg.to === KEY || msg.to === '*') {
+        if (!isTop) picker.onCommand(msg);
+      }
+    } else if (msg.type === 'dom-capture:retry' && isTop && picker.active && picker.mode === 'done') picker.captureTarget();
+  });
+  chrome?.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== 'local' || !('clip' in changes)) return;
+    picker.clip = changes.clip.newValue || null;
+    if (picker.active) picker.refreshBar();
+  });
+  // A parent's handshake: it posted a nonce into this window; the answer goes through the extension.
+  if (!isTop) {
+    window.addEventListener('message', (e) => {
+      const nonce = e.data?.[PICK_MSG];
+      if (typeof nonce !== 'string' || e.source !== window.parent) return;
+      e.stopImmediatePropagation();
+      send({ to: '*', event: 'hello', nonce });
+    });
+  }
+
   globalThis.__domCapturePicker = picker;
-  picker.start();
 })();
