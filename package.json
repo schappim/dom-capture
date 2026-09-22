@@ -1,6 +1,6 @@
 {
   "name": "dom-capture",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Browser extension: pick any element and copy it as self-contained HTML + CSS",
   "license": "MIT",

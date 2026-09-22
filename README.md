@@ -27,7 +27,7 @@ Works on plain pages and on pages built from **web components** — open *and* c
 
 Needs a Chromium-based browser, version 120 or newer.
 
-**Permissions:** `activeTab` + `scripting` (it only ever touches the tab you invoke it on), `clipboardWrite`, and `storage` for your options. No host permissions up front, no background activity, nothing leaves your machine. Access to one more site is asked for only when you capture an `<iframe>` from it and press **Allow** (see [Iframes](#iframes)).
+**Permissions:** `activeTab` + `scripting` (it only ever touches the tab you invoke it on), `clipboardWrite`, and `storage` for your options and for the last capture (so it can be pasted on another page). No host permissions up front, no background activity, nothing leaves your machine. Access to one more site is asked for only when you capture an `<iframe>` from it and press **Allow** (see [Iframes](#iframes)).
 
 ## Use
 
@@ -43,13 +43,34 @@ Needs a Chromium-based browser, version 120 or newer.
 | <kbd>Click</kbd> | select the highlighted element |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | widen to the parent (climbs out of slots and shadow roots too) / narrow back down |
 | <kbd>←</kbd> / <kbd>→</kbd> | previous / next sibling |
-| <kbd>Enter</kbd> | capture the selection |
+| <kbd>Enter</kbd> / <kbd>⌘</kbd><kbd>C</kbd> | capture the selection |
+| <kbd>E</kbd> | edit its text in place |
+| drag / <kbd>M</kbd> | move it elsewhere on the page |
+| <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | swap it with the previous / next sibling |
+| <kbd>X</kbd> / <kbd>⌘</kbd><kbd>X</kbd> | cut: capture it and take it off the page, to paste on another |
+| <kbd>V</kbd> / <kbd>⌘</kbd><kbd>V</kbd> | paste the last capture into this page |
+| <kbd>Delete</kbd> | remove it from the page |
+| <kbd>⌘</kbd><kbd>Z</kbd> | undo the last edit, move, cut, paste or delete |
 | <kbd>Esc</kbd> | drop the selection; again to quit |
 | right-click | quit |
+
+(<kbd>Ctrl</kbd> where there is no <kbd>⌘</kbd>.)
 
 While you pick, an invisible overlay receives the mouse, so the page never sees your hover or click: links don't navigate, menus don't open, and the element is captured in its resting, un-hovered state.
 
 After a capture you can **Adjust selection** (go back and take the parent instead, say), **Copy again**, **Download .html** (a complete standalone page), **Preview** it in a new tab, or **Pick another**.
+
+### Changing the page: edit, move, cut & paste, delete
+
+The selection panel also lets you change the live page. Nothing is saved anywhere — reload and it is gone — but it is a quick way to rearrange, rewrite or mock something up, and to build a page out of pieces of others. Every change has an **Undo** (<kbd>⌘</kbd><kbd>Z</kbd>).
+
+- **Edit text** (<kbd>E</kbd>) makes the selection editable in place — text only, no accidental bold or pasted markup. <kbd>Enter</kbd> keeps the change (<kbd>⌘</kbd><kbd>Enter</kbd> in a `<textarea>`), <kbd>Esc</kbd> discards it, and clicking elsewhere keeps it. A text field or textarea is edited as itself. While you type, the page's own keyboard shortcuts stay out of the way.
+- **Move** — **drag** the element (any element: pressing on something that isn't selected picks it up) to where it goes and release, or press <kbd>M</kbd>, point, and click. Near an element's top or bottom edge (left or right in a row) means *before* / *after* it; the middle of a container means *inside*. Over a list, a stack or a flex row, the drop snaps to the nearest gap between its children, so pointing between two items puts it between them. An insertion line and a label say exactly what will happen before you let go. <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> swaps it with a neighbour without any pointing.
+
+  An element moved under a **different parent keeps its look**: every style its old context gave it — a descendant rule's padding, an inherited font, a `.stack > * + *` margin — is pinned inline wherever the new context would have changed it. A reorder among siblings is left alone, so `:first-child`-style rules still do their job.
+- **Cut** (<kbd>X</kbd>) captures the selection, takes it off this page and keeps it to paste — in any tab or window. Undo brings it back.
+- **Paste** (<kbd>V</kbd>) puts the last capture into the page — this one or any other, the styles come along — with the same drag-free pointing as Move. The capture is kept in the extension's local storage, so it survives navigating and closing tabs. Its CSS goes in as a constructable stylesheet with every declaration `!important`: the page's Content-Security-Policy cannot block it and the page's own `!important` rules cannot restyle it. The markup goes through `DOMParser`, so Trusted Types policies do not object either.
+- **Delete** (<kbd>Delete</kbd>) removes the selection; its parent becomes the selection.
 
 ### Capturing dropdowns, popovers and dialogs
 
@@ -147,6 +168,7 @@ The log is plain text: extension version, page URL, browser, options, the picked
 - You cannot pick an element *inside* an `<iframe>` — only the iframe (with its whole document, see [Iframes](#iframes)) or something around it. A frame the extension cannot be injected into (a `data:` URL, a sandboxed frame on some sites) keeps its `src`.
 - `<video>` and `blob:` media keep their URLs.
 - Quirks-mode pages (no doctype) can differ by a few pixels once pasted into a standards-mode file.
+- Moving an element under a different parent pins its computed styles, not its `::before` / `::after` or `:hover` rules; those still follow whatever the new context says. Changes made to a page live only until it is reloaded.
 - Privileged pages (`chrome://`, the extension gallery, the PDF viewer) can't be scripted at all — the icon shows a red `!` there.
 
 ---
@@ -170,7 +192,7 @@ npm test
 
 **`test/run.mjs`** captures elements from the fixture pages in a real browser, renders the snippet in an empty `about:blank` page and **pixel-diffs** it against the original (currently 0.00% difference), hovers and focuses the copy to verify states, and asserts on the generated markup and CSS — for example, that none of the page's class names appear in the output. `test/fixtures/components.html` is the web-components torture test; `clobber.html` is a page whose named elements shadow DOM properties.
 
-**`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog.
+**`test/e2e.mjs`** loads the real extension, drives the picker with mouse and keyboard, and reads the result from the clipboard — this is what proves closed shadow roots work through `chrome.dom`. `test/fixtures/dropdowns.html` covers picking inside an open popover, a click-outside dropdown in a closed shadow root, and a modal dialog. `edit.html` and `paste-target.html` cover editing text, moving (dragging, pointing, nudging — into gaps, across parents with the look kept, and undone), deleting, and pasting a capture into a page whose own `!important` CSS tries to restyle it.
 
 **`test/e2e-frames.mjs`** captures same-origin, cross-origin and nested iframes (`test/fixtures/frames.html`), pastes the result and compares what the frames show — once with the extension allowed on the frames' site, once with the page's origin only, where the cross-origin frame must keep its `src` and the panel must offer to allow it.
 

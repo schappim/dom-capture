@@ -331,6 +331,229 @@ try {
     () => check('the picker’s own buttons still work behind a modal dialog', true),
     () => check('the picker’s own buttons still work behind a modal dialog', false, 'clicking "Done" did not close the picker'),
   );
+
+  // The page is live: text can be edited in place, elements moved, and the last capture pasted in.
+  console.log('\nedit text, move elements, paste a capture');
+  await page.goto(`${origin}/edit.html`);
+  await page.bringToFront();
+  await inject();
+  await page.waitForSelector('dom-capture-ui', { state: 'attached' });
+  const order = () => page.evaluate(() => [...document.querySelectorAll('#list > li')].map((li) => li.id).join(','));
+  const selectEl = async (sel) => {
+    const [x, y] = await center(sel);
+    await hover(x, y);
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(50);
+  };
+
+  await selectEl('#b');
+  await page.keyboard.press('e');
+  await page.waitForTimeout(50);
+  check('E makes the selection editable', await page.evaluate(() => document.getElementById('b').isContentEditable && document.activeElement?.id === 'b'));
+  await page.keyboard.press('End');
+  await page.keyboard.type(' edited');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(50);
+  check('typing then Enter changes the text', (await page.evaluate(() => document.getElementById('b').textContent)) === 'Beta edited', await page.evaluate(() => document.getElementById('b').textContent));
+  check('…and leaves no contenteditable behind', await page.evaluate(() => !document.getElementById('b').hasAttribute('contenteditable') && document.activeElement !== document.getElementById('b')));
+  check('the page never saw the keys', !(await page.evaluate(() => window.__pageSawKey)), await page.evaluate(() => window.__pageSawKey));
+  await page.keyboard.press('e');
+  await page.keyboard.type('nope');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(50);
+  check('Esc discards an edit', (await page.evaluate(() => document.getElementById('b').textContent)) === 'Beta edited');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(50);
+  check('⌘Z undoes the edit', (await page.evaluate(() => document.getElementById('b').textContent)) === 'Beta', await page.evaluate(() => document.getElementById('b').textContent));
+
+  // A text field is edited as itself.
+  await selectEl('#ta');
+  await page.keyboard.press('e');
+  await page.keyboard.type('Fresh notes');
+  await page.keyboard.press('ControlOrMeta+Enter');
+  await page.waitForTimeout(50);
+  check('a <textarea> takes its new value (⌘Enter keeps it)', (await page.evaluate(() => document.getElementById('ta').value)) === 'Fresh notes', await page.evaluate(() => document.getElementById('ta').value));
+
+  // Shift+arrows swap with a neighbour; undo puts it back.
+  await selectEl('#b');
+  await page.keyboard.press('Shift+ArrowUp');
+  await page.waitForTimeout(50);
+  check('Shift+↑ moves the selection before its previous sibling', (await order()) === 'b,a,c', await order());
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.waitForTimeout(50);
+  check('Shift+↓ moves it after the next one', (await order()) === 'a,c,b', await order());
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(50);
+  check('…and each move can be undone', (await order()) === 'a,b,c', await order());
+
+  // Move by pointing: near an edge = before / after, the middle = inside.
+  await selectEl('#a');
+  await page.keyboard.press('m');
+  const cBox = await page.locator('#c').boundingBox();
+  await hover(cBox.x + 40, cBox.y + cBox.height - 3);
+  await page.waitForTimeout(100);
+  await page.screenshot({ path: path.join(outDir, 'e2e-move.png') });
+  await page.mouse.click(cBox.x + 40, cBox.y + cBox.height - 3);
+  await page.waitForTimeout(50);
+  check('M then a click at the bottom edge of another element drops it after that element', (await order()) === 'b,c,a', await order());
+  await page.keyboard.press('m');
+  const [zx, zy] = await center('#zone');
+  await hover(zx, zy);
+  await page.mouse.click(zx, zy);
+  await page.waitForTimeout(50);
+  check('a click in the middle of a container drops it inside', await page.evaluate(() => document.querySelector('#zone > #a') !== null && document.querySelectorAll('#list > li').length === 2));
+  await page.keyboard.press('e'); // (content scripts live in an isolated world: the selection shows through what the keys do)
+  await page.keyboard.press('End');
+  await page.keyboard.type('!');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(50);
+  check('the moved element stays selected', (await page.evaluate(() => document.querySelector('#zone > #a')?.textContent)) === 'Alpha!');
+  // In a row, before / after is left / right.
+  await selectEl('#r3');
+  await page.keyboard.press('m');
+  const r1 = await page.locator('#r1').boundingBox();
+  await hover(r1.x + 3, r1.y + r1.height / 2);
+  await page.mouse.click(r1.x + 3, r1.y + r1.height / 2);
+  await page.waitForTimeout(50);
+  check('in a flex row, the left edge means "before"', (await page.evaluate(() => [...document.querySelectorAll('#row > span')].map((s) => s.id).join(','))) === 'r3,r1,r2');
+  await page.keyboard.press('m');
+  await hover(zx, zy);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(50);
+  const rowOrder = () => page.evaluate(() => [...document.querySelectorAll('#row > *')].map((s) => s.id).join(','));
+  check('Esc cancels a move', await page.evaluate(() => document.querySelector('#zone > #r3') === null) && (await rowOrder()) === 'r3,r1,r2');
+  await page.keyboard.press('Shift+ArrowRight');
+  await page.waitForTimeout(50);
+  check('…keeping the selection (Shift+→ still moves it)', (await rowOrder()) === 'r1,r3,r2', await rowOrder());
+
+  // Drag: press on the selection, move, release where it goes.
+  await selectEl('#b');
+  const [bx2, by2] = await center('#b');
+  await page.mouse.move(bx2, by2);
+  await page.mouse.down();
+  await page.mouse.move(bx2 + 10, by2 + 10);
+  const zone2 = await page.locator('#zone').boundingBox(); // (it grew when #a went in)
+  await page.mouse.move(zone2.x + 40, zone2.y + zone2.height - 8, { steps: 8 }); // its bottom padding: after the last child
+  await page.waitForTimeout(100);
+  await page.screenshot({ path: path.join(outDir, 'e2e-drag.png') });
+  await page.mouse.up();
+  await page.waitForTimeout(50);
+  check('dragging the selection and releasing in a container’s padding drops it after its last child', await page.evaluate(() => document.querySelector('#zone > #a + #b') !== null), await page.evaluate(() => document.getElementById('b').parentElement.id));
+  await page.keyboard.press('Shift+ArrowUp');
+  await page.waitForTimeout(50);
+  check('…and it stays selected', await page.evaluate(() => document.querySelector('#zone > #b + #a') !== null));
+  // Between two items: releasing in the gap between them (the container's own pixels) lands there.
+  const aBox = await page.locator('#zone > #a').boundingBox();
+  await page.mouse.move(aBox.x + 30, aBox.y + aBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(aBox.x + 40, aBox.y + aBox.height / 2 + 10);
+  const r1Box = await page.locator('#r1').boundingBox();
+  await page.mouse.move(r1Box.x + r1Box.width + 4, r1Box.y + r1Box.height / 2, { steps: 6 }); // the 8px flex gap after #r1
+  await page.waitForTimeout(100);
+  await page.screenshot({ path: path.join(outDir, 'e2e-drag-gap.png') });
+  await page.mouse.up();
+  await page.waitForTimeout(50);
+  check('releasing in the gap between two items puts it between them', (await rowOrder()) === 'r1,a,r3,r2', `${await rowOrder()} (#a is in ${await page.evaluate(() => { const a = document.getElementById('a'); return `${a.parentElement?.id || a.parentElement?.localName} after ${a.previousElementSibling?.id || a.previousElementSibling?.localName}`; })})`);
+  await page.waitForTimeout(50);
+  await page.keyboard.press('ControlOrMeta+z'); // the gap drag
+  await page.keyboard.press('ControlOrMeta+z'); // Shift+↑
+  await page.keyboard.press('ControlOrMeta+z'); // the first drag
+  await page.waitForTimeout(50);
+  check('…and each drag can be undone', (await order()) === 'b,c' && (await page.evaluate(() => document.querySelector('#zone > #a') !== null)), await order());
+  // A drag released without a destination (over the element itself) changes nothing.
+  const [cx2, cy2] = await center('#c');
+  await selectEl('#c');
+  await page.mouse.move(cx2, cy2);
+  await page.mouse.down();
+  await page.mouse.move(cx2 + 12, cy2 + 2, { steps: 3 });
+  await page.mouse.up();
+  await page.waitForTimeout(50);
+  check('a drag released over the element itself is a no-op', (await order()) === 'b,c' && (await page.evaluate(() => document.querySelector('#zone > #a') !== null)));
+
+  // Delete, and undo.
+  await page.keyboard.press('Delete');
+  await page.waitForTimeout(50);
+  check('Delete removes the selection from the page', (await order()) === 'b', await order());
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.waitForTimeout(50);
+  check('…and selects its parent', await page.evaluate(() => document.getElementById('list').previousElementSibling?.id === 'card'));
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(50);
+  check('…and can be undone', (await order()) === 'b,c' && (await page.evaluate(() => document.getElementById('list').nextElementSibling?.id === 'card')), await order());
+
+  // Moved under another parent, an element keeps the look its old context gave it.
+  await selectEl('#addr');
+  const addrWas = await page.evaluate(() => {
+    const cs = getComputedStyle(document.getElementById('addr'));
+    return { padding: cs.paddingLeft, color: cs.color, weight: getComputedStyle(document.querySelector('#addr b')).fontWeight, font: cs.fontFamily };
+  });
+  await page.keyboard.press('m');
+  const zone3 = await page.locator('#zone').boundingBox();
+  await hover(zone3.x + 40, zone3.y + 6); // its top padding: before the first child
+  await page.mouse.click(zone3.x + 40, zone3.y + 6);
+  await page.waitForTimeout(50);
+  const addrNow = await page.evaluate(() => {
+    const el = document.getElementById('addr');
+    const cs = getComputedStyle(el);
+    return { parent: el.parentElement.id, first: el.parentElement.firstElementChild === el, padding: cs.paddingLeft, color: cs.color, weight: getComputedStyle(el.querySelector('b')).fontWeight, font: cs.fontFamily, radius: cs.borderRadius };
+  });
+  check('a move to another parent lands where pointed (before the container’s first child)', addrNow.parent === 'zone' && addrNow.first, JSON.stringify(addrNow));
+  check('…and keeps the padding, colour and font its old parent’s rules gave it', addrNow.padding === addrWas.padding && addrNow.color === addrWas.color && addrNow.weight === addrWas.weight && addrNow.font === addrWas.font && addrNow.padding === '16px', `${JSON.stringify(addrWas)} vs ${JSON.stringify(addrNow)}`);
+  check('…even where the new context would restyle it (the zone rounds its children; this one keeps its corners)', addrNow.radius === '0px', addrNow.radius);
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(50);
+  check('undoing the move also drops the pinned styles', await page.evaluate(() => { const el = document.getElementById('addr'); return el.parentElement.id === 'section' && !el.getAttribute('style') && !el.querySelector('b').getAttribute('style'); }));
+
+  // Capture the card, then paste it into another page — where it must look the same despite that page's CSS.
+  const cardBox = await page.locator('#card').boundingBox();
+  await hover(cardBox.x + 8, cardBox.y + 8); // in its padding: the card itself, not the heading
+  await page.mouse.click(cardBox.x + 8, cardBox.y + 8);
+  const cardWas = await page.evaluate(() => {
+    const el = document.getElementById('card');
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const h2 = getComputedStyle(el.querySelector('h2'));
+    return { width: r.width, height: r.height, radius: cs.borderRadius, image: cs.backgroundImage, h2size: h2.fontSize, h2color: h2.color };
+  });
+  await page.keyboard.press('Enter');
+  await copied('Quarterly report');
+  check('a capture is kept for pasting', await sw.evaluate(async () => (await chrome.storage.local.get('clip')).clip?.label === 'article#card.card'), await sw.evaluate(async () => (await chrome.storage.local.get('clip')).clip?.label));
+
+  await page.goto(`${origin}/paste-target.html`);
+  await page.bringToFront();
+  await inject();
+  await page.waitForSelector('dom-capture-ui', { state: 'attached' });
+  await page.keyboard.press('v');
+  const hereBox = await page.locator('#here').boundingBox();
+  await hover(hereBox.x + 60, hereBox.y + 2);
+  await page.waitForTimeout(100);
+  await page.screenshot({ path: path.join(outDir, 'e2e-paste-pointing.png') });
+  await page.mouse.click(hereBox.x + 60, hereBox.y + 2);
+  await page.waitForTimeout(100);
+  await page.screenshot({ path: path.join(outDir, 'e2e-pasted.png') });
+  const dropped = await page.evaluate(() => {
+    const el = document.getElementById('here').previousElementSibling;
+    if (!el || el.localName !== 'article') return null;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const h2 = getComputedStyle(el.querySelector('h2'));
+    return { width: r.width, height: r.height, radius: cs.borderRadius, image: cs.backgroundImage, h2size: h2.fontSize, h2color: h2.color, border: cs.borderTopWidth, text: el.textContent.trim(), sheets: document.adoptedStyleSheets.length, styles: document.querySelectorAll('style').length };
+  });
+  check('V then a click at the top edge of an element pastes the capture before it', !!dropped && dropped.text.startsWith('Quarterly report'), JSON.stringify(dropped));
+  check('the pasted element has the size and look it had on the source page', !!dropped && Math.abs(dropped.width - cardWas.width) < 1 && Math.abs(dropped.height - cardWas.height) < 1 && dropped.radius === cardWas.radius && dropped.image === cardWas.image, `${JSON.stringify(cardWas)} vs ${JSON.stringify(dropped)}`);
+  check('the destination page’s own CSS (red !important border, 40px red headings) does not touch it', !!dropped && dropped.border === '0px' && dropped.h2size === cardWas.h2size && dropped.h2color === cardWas.h2color, JSON.stringify(dropped));
+  check('its styles went in as a constructable stylesheet, not a <style> the CSP could block', !!dropped && dropped.sheets === 1 && dropped.styles === 1);
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.waitForTimeout(50);
+  check('the pasted element is selected, ready to be moved', await page.evaluate(() => document.getElementById('here').nextElementSibling?.localName === 'article'));
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.keyboard.press('ControlOrMeta+z');
+  await page.waitForTimeout(50);
+  check('⌘Z removes it again, stylesheet included', await page.evaluate(() => !document.querySelector('article') && document.adoptedStyleSheets.length === 0));
 } catch (e) {
   check('e2e threw', false, e.stack);
 } finally {

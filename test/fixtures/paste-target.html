@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Paste target — a page with hostile styles of its own</title>
+<style>
+  body { margin: 0; padding: 40px; font: 18px/1.6 Georgia, serif; background: #0f172a; color: #e2e8f0; }
+  article { border: 6px solid red !important; padding: 40px !important; }
+  h2 { font-size: 40px; color: red; text-decoration: underline; }
+  p { font-style: italic; }
+  .card { display: none; }
+</style>
+</head>
+<body>
+<h1 id="title">Somewhere else entirely</h1>
+<p id="here">The captured card should appear above this paragraph, looking exactly as it did.</p>
+<div id="box" style="min-height: 100px; border: 1px solid #334155; padding: 12px;">An empty box to paste into.</div>
+</body>
+</html>
